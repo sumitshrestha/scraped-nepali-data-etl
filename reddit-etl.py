@@ -1,6 +1,7 @@
-# ...existing code...
+
+import os
+import json
 import logging
-# Load environment variables from .env
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,11 +12,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-
-# Load environment variables from .env
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
 def extract_post_info(post):

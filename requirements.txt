@@ -1,1 +1,5 @@
 python-dotenv
+# The following are standard library modules and do not need to be installed:
+# os
+# json
+# logging
