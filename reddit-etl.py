@@ -37,31 +37,89 @@ def extract_comment_info(comment):
 
 
 def parse_post_json(post_json):
+    """
+    Parse Reddit JSON into a list of post dicts (each with a 'comments' key).
+
+    Handles two shapes:
+      - list  → single post + comments  (individual post JSON files)
+      - dict  → listing of posts        (posts.json / links.json)
+
+    Returns a list of post dicts, or None if the structure is unrecognised.
+    """
     if isinstance(post_json, list) and post_json:
-        post_data = post_json[0].get("data", {}).get("children", [])[0].get("data", {})
+        # Guard: some listing files are accidentally saved as a list with
+        # no children (e.g. empty links.json) — skip them gracefully.
+        children = post_json[0].get("data", {}).get("children", [])
+        if not children:
+            return None
+        post_data = children[0].get("data", {})
         post_info = extract_post_info(post_data)
         if len(post_json) > 1:
-            comments = post_json[1].get("data", {}).get("children", [])
-            for c in comments:
+            for c in post_json[1].get("data", {}).get("children", []):
                 if c.get("kind") == "t1":
                     post_info["comments"].append(
                         extract_comment_info(c.get("data", {}))
                     )
-        return post_info
-    elif isinstance(post_json, dict):
+        return [post_info]
+
+    if isinstance(post_json, dict):
         posts = []
         for child in post_json.get("data", {}).get("children", []):
-            post_info = extract_post_info(child.get("data", {}))
-            posts.append(post_info)
-        return posts
+            posts.append(extract_post_info(child.get("data", {})))
+        return posts or None
+
     return None
+
+
+def is_post_nepali(post_flat: dict, lang_filter: NepaliFilter) -> bool:
+    """
+    Return True if the post should be kept.
+
+    Strategy
+    --------
+    Posts from Nepal subreddits often have English titles that mention
+    Nepali place names ("Some rocks I found at Udayapur.").  Using
+    is_nepali() with its high 0.85 threshold lets these through because
+    Lingua isn't confident enough to call them English.
+
+    Instead we use is_english() with its lower 0.50 threshold — if Lingua
+    is even moderately sure the text is English, we discard it.  This is
+    the correct trade-off for posts: a few false discards of borderline
+    romanized Nepali posts are acceptable; keeping hundreds of English posts
+    is not.
+
+    We check title and content together so that link posts (null content)
+    and text posts (null title body) are both handled.
+    """
+    post_text = " ".join(
+        filter(
+            None,
+            [
+                post_flat.get("title") or "",
+                post_flat.get("content") or "",
+            ],
+        )
+    ).strip()
+
+    if not post_text:
+        # No text at all (media-only post with no title) — keep it;
+        # it came from a Nepali subreddit so it's probably relevant.
+        return True
+
+    # Discard if Lingua is moderately confident this is English or Spanish
+    if lang_filter.is_english(post_text):
+        return False
+    if lang_filter.is_spanish(post_text):
+        return False
+
+    return True
 
 
 def main(scraped_dir):
     start_time = time.time()
     logging.info("Starting extraction from directory: %s", scraped_dir)
 
-    # Load the filter once — reused for every comment across all files
+    # Load filter once — both post and comment filtering reuse this instance
     lang_filter = NepaliFilter()
 
     posts_and_comments = []
@@ -86,26 +144,14 @@ def main(scraped_dir):
                 if not parsed:
                     continue
 
-                for post in parsed if isinstance(parsed, list) else [parsed]:
+                for post in parsed:
                     post_flat = dict(post)
                     post_flat["kind"] = "post"
                     comments = post_flat.pop("comments", [])
 
-                    # Filter post by its text content — title + body.
-                    # We check both because some posts have no body (link posts)
-                    # but have a Nepali title, and vice versa.
-                    post_text = " ".join(
-                        filter(
-                            None,
-                            [
-                                post_flat.get("title") or "",
-                                post_flat.get("content") or "",
-                            ],
-                        )
-                    )
-                    if not lang_filter.is_nepali(post_text):
-                        comment_discarded += len(comments)
+                    if not is_post_nepali(post_flat, lang_filter):
                         post_discarded += 1
+                        comment_discarded += len(comments)
                         logging.debug(
                             "Discarded post %s: not Nepali", post_flat.get("id")
                         )
@@ -116,6 +162,9 @@ def main(scraped_dir):
 
                     for comment in comments:
                         body = comment.get("body") or ""
+                        # Comments use the conservative is_nepali() threshold —
+                        # short romanized Nepali comments look ambiguous to Lingua
+                        # so we want to keep anything that isn't clearly EN/ES.
                         if not lang_filter.is_nepali(body):
                             comment_discarded += 1
                             logging.debug(
@@ -136,7 +185,8 @@ def main(scraped_dir):
 
     elapsed = time.time() - start_time
     logging.info(
-        "Processed %d files | %d posts kept | %d posts discarded | %d comments kept | %d comments discarded",
+        "Processed %d files | %d posts kept | %d posts discarded "
+        "| %d comments kept | %d comments discarded",
         file_count,
         post_count,
         post_discarded,
