@@ -64,8 +64,10 @@ def parse_post_json(post_json):
 def main(scraped_dir):
     start_time = time.time()
     logging.info(f"Starting extraction from directory: {scraped_dir}")
-    results = []
+    posts_and_comments = []
     file_count = 0
+    post_count = 0
+    comment_count = 0
     for root, dirs, files in os.walk(scraped_dir):
         for file in files:
             if file.endswith(".json"):
@@ -77,21 +79,31 @@ def main(scraped_dir):
                         parsed = parse_post_json(data)
                         if parsed:
                             if isinstance(parsed, list):
-                                results.extend(parsed)
+                                posts = parsed
                             else:
-                                results.append(parsed)
+                                posts = [parsed]
+                            for post in posts:
+                                post_flat = dict(post)
+                                post_flat["kind"] = "post"
+                                comments = post_flat.pop("comments", [])
+                                posts_and_comments.append(post_flat)
+                                post_count += 1
+                                for comment in comments:
+                                    comment_flat = dict(comment)
+                                    comment_flat["kind"] = "comment"
+                                    comment_flat["post_id"] = post_flat["id"]
+                                    posts_and_comments.append(comment_flat)
+                                    comment_count += 1
                     logging.info(f"Processed file: {path}")
                 except Exception as e:
                     logging.error(f"Error reading {path}: {e}")
-    total_posts = len(results)
-    total_comments = sum(len(post.get("comments", [])) for post in results)
     elapsed = time.time() - start_time
-    logging.info(f"Processed {file_count} JSON files. Extracted {total_posts} posts and {total_comments} comments.")
+    logging.info(f"Processed {file_count} JSON files. Extracted {post_count} posts and {comment_count} comments.")
     logging.info(f"Total time elapsed: {elapsed:.2f} seconds.")
     # Save or print results
     try:
         with open("extracted_posts.json", "w", encoding="utf-8") as out:
-            json.dump(results, out, indent=2, ensure_ascii=False)
+            json.dump(posts_and_comments, out, indent=2, ensure_ascii=False)
         logging.info("Extraction complete. Results saved to extracted_posts.json.")
     except Exception as e:
         logging.error(f"Failed to write output file: {e}")
