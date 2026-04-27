@@ -1,5 +1,3 @@
 python-dotenv
-# The following are standard library modules and do not need to be installed:
-# os
-# json
-# logging
+lingua-language-detector
+# backports.zoneinfo; python_version<'3.9'  # Uncomment if you use zoneinfo and need Python <3.9 support
