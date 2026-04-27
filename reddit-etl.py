@@ -167,47 +167,66 @@ def parse_post_json(post_json):
     return None
 
 
-def is_post_nepali(post_flat: dict, lang_filter: NepaliFilter) -> bool:
+def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter) -> bool:
     """
-    Return True if the post should be kept.
+    Return True if a single piece of text qualifies as romanized Nepali.
+    Used independently on title and content so each field is judged on its own.
+    """
+    if not text or not text.strip():
+        return False
+    latin_words = {w.lower() for w in lang_filter.latin_words(text)}
+    if not latin_words:
+        return False
+    if not lang_filter.is_nepali(text):
+        return False
+    if not (latin_words & _ROMANIZED_NEPALI_SIGNALS):
+        return False
+    return True
 
-    Same rule as comments: only romanized (Latin-script) Nepali is kept.
-    Purely Devanagari posts are discarded just like purely Devanagari comments.
 
-    A post is kept only when ALL of these hold:
-      - Has at least one Latin word (not purely Devanagari or empty)
-      - Passes is_nepali() (Lingua is not confident it is EN or ES)
-      - Contains at least one romanized Nepali signal word
+def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
+    """
+    Decide whether to keep a post and strip any non-Nepali fields.
 
-    Examples:
-      "Some of the best rocks I found at Udayapur."  → no signal word  → DISCARD
-      "It was a good weather for contemplation."      → no signal word  → DISCARD
-      "वैशाख १२, २०७२ शनिबार"                        → no Latin words  → DISCARD
-      "Tokla tea bags ma microplastic cha hola?"      → ma, cha, hola   → KEEP
-      "inheritance mudda ko faisala vako din..."      → ko, vako, dai   → KEEP
-      "yo vayo ni cha — वैशाख"                       → yo, ni, cha     → KEEP (mixed)
+    Returns a cleaned post dict if it should be kept, or None to discard.
+
+    Rules
+    -----
+    - The post is kept if title OR content is romanized Nepali.
+    - A field (title or content) is set to None if it is not romanized Nepali,
+      so downstream consumers only ever see Nepali text.
+
+    Examples
+    --------
+      title="Financial advice needed"   content="Maile nic asia bank bata..."
+        → title cleared (English), content kept               → KEEP
+
+      title="Tokla tea bags ma cha hola?" content=None
+        → title kept, content stays None                      → KEEP
+
+      title="Some rocks at Udayapur"    content=None
+        → title cleared, no content → nothing left            → DISCARD
+
+      title="वैशाख १२"                  content=None
+        → title cleared (Devanagari), no content              → DISCARD
+
+      title="Minor road accident"       content="Hijo 22 April accident bhayo..."
+        → title cleared (English), content kept               → KEEP
     """
     title = post_flat.get("title") or ""
     content = post_flat.get("content") or ""
-    post_text = f"{title} {content}".strip()
 
-    if not post_text:
-        return False
+    title_ok = _is_romanized_nepali_text(title, lang_filter)
+    content_ok = _is_romanized_nepali_text(content, lang_filter)
 
-    # No Latin words at all (purely Devanagari or emoji/numbers) → discard
-    latin_words = {w.lower() for w in lang_filter.latin_words(post_text)}
-    if not latin_words:
-        return False
+    # Discard if neither field has any romanized Nepali
+    if not title_ok and not content_ok:
+        return None
 
-    # Lingua must not be confident this is English or Spanish
-    if not lang_filter.is_nepali(post_text):
-        return False
-
-    # Must contain at least one romanized Nepali signal word
-    if not (latin_words & _ROMANIZED_NEPALI_SIGNALS):
-        return False
-
-    return True
+    result = dict(post_flat)
+    result["title"] = title if title_ok else None
+    result["content"] = content if content_ok else None
+    return result
 
 
 def main(scraped_dir):
@@ -244,7 +263,8 @@ def main(scraped_dir):
                     post_flat["kind"] = "post"
                     comments = post_flat.pop("comments", [])
 
-                    if not is_post_nepali(post_flat, lang_filter):
+                    cleaned = process_post(post_flat, lang_filter)
+                    if cleaned is None:
                         post_discarded += 1
                         comment_discarded += len(comments)
                         logging.debug(
@@ -254,7 +274,7 @@ def main(scraped_dir):
                         )
                         continue
 
-                    posts_and_comments.append(post_flat)
+                    posts_and_comments.append(cleaned)
                     post_count += 1
 
                     for comment in comments:
