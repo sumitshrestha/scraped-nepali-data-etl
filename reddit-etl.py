@@ -11,7 +11,10 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("etl.log", encoding="utf-8")
+    ]
 )
 
 # Romanized Nepali signal words used as a positive gate for post filtering.
