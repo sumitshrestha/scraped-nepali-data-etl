@@ -14,6 +14,104 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 
+# Romanized Nepali signal words used as a positive gate for post filtering.
+# A post with no Devanagari must contain at least one of these to be kept.
+# These are common enough that genuine Nepali posts almost always hit one,
+# but rare enough in plain English that false positives are minimal.
+_ROMANIZED_NEPALI_SIGNALS = {
+    "ma",
+    "ta",
+    "yo",
+    "ko",
+    "ka",
+    "ki",
+    "le",
+    "lai",
+    "bata",
+    "sang",
+    "sanga",
+    "pani",
+    "ni",
+    "nai",
+    "ra",
+    "tara",
+    "ani",
+    "cha",
+    "chha",
+    "chau",
+    "thiyo",
+    "thyo",
+    "hos",
+    "garnu",
+    "garne",
+    "garchan",
+    "garchhu",
+    "gardai",
+    "garyo",
+    "bhayo",
+    "bhanna",
+    "bhannu",
+    "huncha",
+    "hudaina",
+    "basyo",
+    "aayo",
+    "gayo",
+    "lyayo",
+    "dherai",
+    "ramro",
+    "sano",
+    "thulo",
+    "manchhe",
+    "manche",
+    "naam",
+    "geet",
+    "gana",
+    "sundar",
+    "mitho",
+    "dukha",
+    "sukha",
+    "saathi",
+    "dai",
+    "didi",
+    "bhai",
+    "bahini",
+    "aama",
+    "baba",
+    "nepali",
+    "kathmandu",
+    "yar",
+    "yaar",
+    "hajur",
+    "haina",
+    "hoina",
+    "kasto",
+    "kasari",
+    "kaha",
+    "kahile",
+    "pachi",
+    "agadi",
+    "afu",
+    "afai",
+    "hola",
+    "hunu",
+    "vayo",
+    "vanne",
+    "vanda",
+    "vayera",
+    "garda",
+    "herda",
+    "aaja",
+    "hijo",
+    "bholi",
+    "chai",
+    "ni",
+    "ali",
+    "ekdum",
+    "purai",
+    "kehi",
+    "kei",
+}
+
 
 def extract_post_info(post):
     return {
@@ -47,8 +145,6 @@ def parse_post_json(post_json):
     Returns a list of post dicts, or None if the structure is unrecognised.
     """
     if isinstance(post_json, list) and post_json:
-        # Guard: some listing files are accidentally saved as a list with
-        # no children (e.g. empty links.json) — skip them gracefully.
         children = post_json[0].get("data", {}).get("children", [])
         if not children:
             return None
@@ -75,41 +171,40 @@ def is_post_nepali(post_flat: dict, lang_filter: NepaliFilter) -> bool:
     """
     Return True if the post should be kept.
 
-    Strategy
-    --------
-    Posts from Nepal subreddits often have English titles that mention
-    Nepali place names ("Some rocks I found at Udayapur.").  Using
-    is_nepali() with its high 0.85 threshold lets these through because
-    Lingua isn't confident enough to call them English.
+    Same rule as comments: only romanized (Latin-script) Nepali is kept.
+    Purely Devanagari posts are discarded just like purely Devanagari comments.
 
-    Instead we use is_english() with its lower 0.50 threshold — if Lingua
-    is even moderately sure the text is English, we discard it.  This is
-    the correct trade-off for posts: a few false discards of borderline
-    romanized Nepali posts are acceptable; keeping hundreds of English posts
-    is not.
+    A post is kept only when ALL of these hold:
+      - Has at least one Latin word (not purely Devanagari or empty)
+      - Passes is_nepali() (Lingua is not confident it is EN or ES)
+      - Contains at least one romanized Nepali signal word
 
-    We check title and content together so that link posts (null content)
-    and text posts (null title body) are both handled.
+    Examples:
+      "Some of the best rocks I found at Udayapur."  → no signal word  → DISCARD
+      "It was a good weather for contemplation."      → no signal word  → DISCARD
+      "वैशाख १२, २०७२ शनिबार"                        → no Latin words  → DISCARD
+      "Tokla tea bags ma microplastic cha hola?"      → ma, cha, hola   → KEEP
+      "inheritance mudda ko faisala vako din..."      → ko, vako, dai   → KEEP
+      "yo vayo ni cha — वैशाख"                       → yo, ni, cha     → KEEP (mixed)
     """
-    post_text = " ".join(
-        filter(
-            None,
-            [
-                post_flat.get("title") or "",
-                post_flat.get("content") or "",
-            ],
-        )
-    ).strip()
+    title = post_flat.get("title") or ""
+    content = post_flat.get("content") or ""
+    post_text = f"{title} {content}".strip()
 
     if not post_text:
-        # No text at all (media-only post with no title) — keep it;
-        # it came from a Nepali subreddit so it's probably relevant.
-        return True
-
-    # Discard if Lingua is moderately confident this is English or Spanish
-    if lang_filter.is_english(post_text):
         return False
-    if lang_filter.is_spanish(post_text):
+
+    # No Latin words at all (purely Devanagari or emoji/numbers) → discard
+    latin_words = {w.lower() for w in lang_filter.latin_words(post_text)}
+    if not latin_words:
+        return False
+
+    # Lingua must not be confident this is English or Spanish
+    if not lang_filter.is_nepali(post_text):
+        return False
+
+    # Must contain at least one romanized Nepali signal word
+    if not (latin_words & _ROMANIZED_NEPALI_SIGNALS):
         return False
 
     return True
@@ -153,7 +248,9 @@ def main(scraped_dir):
                         post_discarded += 1
                         comment_discarded += len(comments)
                         logging.debug(
-                            "Discarded post %s: not Nepali", post_flat.get("id")
+                            "Discarded post %s: %s",
+                            post_flat.get("id"),
+                            post_flat.get("title", "")[:60],
                         )
                         continue
 
@@ -162,9 +259,9 @@ def main(scraped_dir):
 
                     for comment in comments:
                         body = comment.get("body") or ""
-                        # Comments use the conservative is_nepali() threshold —
-                        # short romanized Nepali comments look ambiguous to Lingua
-                        # so we want to keep anything that isn't clearly EN/ES.
+                        # Comments use the conservative is_nepali() threshold:
+                        # short romanized Nepali comments look ambiguous to
+                        # Lingua so we keep anything not clearly EN/ES.
                         if not lang_filter.is_nepali(body):
                             comment_discarded += 1
                             logging.debug(
