@@ -80,7 +80,9 @@ def main(scraped_dir):
                     logging.info(f"Processed file: {path}")
                 except Exception as e:
                     logging.error(f"Error reading {path}: {e}")
-    logging.info(f"Processed {file_count} JSON files. Extracted {len(results)} posts.")
+    total_posts = len(results)
+    total_comments = sum(len(post.get("comments", [])) for post in results)
+    logging.info(f"Processed {file_count} JSON files. Extracted {total_posts} posts and {total_comments} comments.")
     # Save or print results
     try:
         with open("extracted_posts.json", "w", encoding="utf-8") as out:
