@@ -21,29 +21,61 @@ logging.basicConfig(
 # A post with no Devanagari must contain at least one of these to be kept.
 # These are common enough that genuine Nepali posts almost always hit one,
 # but rare enough in plain English that false positives are minimal.
+# Words that are grammatically Nepali — particles, verb forms, pronouns,
+# postpositions — things that would never appear in a natural English or
+# Spanish sentence.  Proper nouns (Kathmandu, Nepali, Pokhara) are
+# intentionally excluded: they appear in English sentences about Nepal
+# constantly and give no signal that the *language* of the text is Nepali.
 _ROMANIZED_NEPALI_SIGNALS = {
-    "ma",
-    "ta",
-    "yo",
-    "ko",
-    "ka",
-    "ki",
-    "le",
+    # Postpositions / case markers
     "lai",
     "bata",
-    "sang",
     "sanga",
+    "sang",
+    "bhanda",
+    "vanda",
+    "samma",
+    "dekhi",
+    "tiir",
+    "tira",
+    # Particles
     "pani",
-    "ni",
     "nai",
-    "ra",
-    "tara",
-    "ani",
+    "chai",
+    "ni",
+    "ta",
+    "hai",
+    "hola",
+    "nah",
+    "kei",
+    "kehi",
+    "ekdum",
+    "purai",
+    "ali",
+    "dherai",
+    # Pronouns / determiners
+    "yo",
+    "tyo",
+    "yо",
+    "tyо",
+    "yei",
+    "tei",
+    "afu",
+    "afai",
+    # Common verb stems / conjugated forms
     "cha",
     "chha",
     "chau",
+    "chan",
+    "chhu",
     "thiyo",
     "thyo",
+    "thiye",
+    "thiyo",
+    "hola",
+    "huncha",
+    "hudaina",
+    "hunu",
     "hos",
     "garnu",
     "garne",
@@ -51,68 +83,71 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "garchhu",
     "gardai",
     "garyo",
+    "vayo",
     "bhayo",
+    "vanne",
     "bhanna",
     "bhannu",
-    "huncha",
-    "hudaina",
+    "vayera",
+    "bhayera",
     "basyo",
     "aayo",
     "gayo",
     "lyayo",
-    "dherai",
-    "ramro",
-    "sano",
-    "thulo",
+    "raheko",
+    "rahecha",
+    "gareko",
+    "garera",
+    "gareda",
+    "garda",
+    "herda",
+    "milcha",
+    "milena",
+    "sakcha",
+    "sakina",
+    # Common Nepali-only nouns / adjectives (not place names)
     "manchhe",
     "manche",
-    "naam",
-    "geet",
-    "gana",
-    "sundar",
-    "mitho",
-    "dukha",
-    "sukha",
     "saathi",
+    "aama",
+    "baba",
     "dai",
     "didi",
     "bhai",
     "bahini",
-    "aama",
-    "baba",
-    "nepali",
-    "kathmandu",
-    "yar",
-    "yaar",
     "hajur",
-    "haina",
-    "hoina",
+    "ramro",
+    "sano",
+    "thulo",
+    "mitho",
+    "garo",
+    "dukha",
+    "sukha",
     "kasto",
     "kasari",
-    "kaha",
-    "kahile",
-    "pachi",
-    "agadi",
-    "afu",
-    "afai",
-    "hola",
-    "hunu",
-    "vayo",
-    "vanne",
-    "vanda",
-    "vayera",
-    "garda",
-    "herda",
+    # Time / discourse words
     "aaja",
     "hijo",
     "bholi",
-    "chai",
-    "ni",
-    "ali",
-    "ekdum",
-    "purai",
-    "kehi",
+    "aaile",
+    "pachi",
+    "agadi",
+    "kahile",
+    "kaha",
+    "kina",
     "kei",
+    "kehi",
+    # Common discourse / filler (unique to Nepali)
+    "yar",
+    "yaar",
+    "haina",
+    "hoina",
+    "haina",
+    "tara",
+    "ani",
+    "ra",
+    "ki",
+    "ka",
 }
 
 
@@ -202,19 +237,19 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
     Examples
     --------
       title="Financial advice needed"   content="Maile nic asia bank bata..."
-        → title cleared (English), content kept               → KEEP
+        → title cleared (English, no signal), content kept    → KEEP
 
       title="Tokla tea bags ma cha hola?" content=None
-        → title kept, content stays None                      → KEEP
+        → title kept (signal: cha, hola), content stays None  → KEEP
 
-      title="Some rocks at Udayapur"    content=None
-        → title cleared, no content → nothing left            → DISCARD
+      title="Best affordable hotel in Kathmandu" content=None
+        → title cleared (English, "Kathmandu" is not a signal) → DISCARD
 
       title="वैशाख १२"                  content=None
-        → title cleared (Devanagari), no content              → DISCARD
+        → title cleared (Devanagari, no Latin words)          → DISCARD
 
       title="Minor road accident"       content="Hijo 22 April accident bhayo..."
-        → title cleared (English), content kept               → KEEP
+        → title cleared (English), content kept (bhayo)       → KEEP
     """
     title = post_flat.get("title") or ""
     content = post_flat.get("content") or ""
