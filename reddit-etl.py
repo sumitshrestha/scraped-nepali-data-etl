@@ -1,7 +1,9 @@
 
+
 import os
 import json
 import logging
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -60,6 +62,7 @@ def parse_post_json(post_json):
 
 
 def main(scraped_dir):
+    start_time = time.time()
     logging.info(f"Starting extraction from directory: {scraped_dir}")
     results = []
     file_count = 0
@@ -82,7 +85,9 @@ def main(scraped_dir):
                     logging.error(f"Error reading {path}: {e}")
     total_posts = len(results)
     total_comments = sum(len(post.get("comments", [])) for post in results)
+    elapsed = time.time() - start_time
     logging.info(f"Processed {file_count} JSON files. Extracted {total_posts} posts and {total_comments} comments.")
+    logging.info(f"Total time elapsed: {elapsed:.2f} seconds.")
     # Save or print results
     try:
         with open("extracted_posts.json", "w", encoding="utf-8") as out:
