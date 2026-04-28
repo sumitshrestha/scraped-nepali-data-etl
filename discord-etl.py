@@ -616,16 +616,18 @@ def main(export_dir: str) -> None:
     start = time.time()
     logging.info("Discord ETL starting. Input dir: %s", export_dir)
     logging.info("Output: %s  |  Discard log: %s", OUTPUT_FILE, DISCARD_LOG)
-    logging.info(
-        "Config: MIN_LATIN_WORDS=%d  DENSITY=%.2f  "
-        "EN=%.2f  ES=%.2f  MRD=%.2f  LOW_MEM=%s",
-        MIN_LATIN_WORDS,
-        ENGLISH_DENSITY_THRESHOLD,
-        LINGUA_ENGLISH_THRESHOLD,
-        LINGUA_SPANISH_THRESHOLD,
-        LINGUA_MIN_RELATIVE_DISTANCE,
-        LINGUA_LOW_MEMORY,
-    )
+    logging.info("--- Runtime Configuration ---")
+    logging.info("DISCORD_EXPORT_DIR: %s", export_dir)
+    logging.info("OUTPUT_FILE: %s", OUTPUT_FILE)
+    logging.info("DISCARD_LOG: %s", DISCARD_LOG)
+    logging.info("LOG_EVERY: %d", LOG_EVERY)
+    logging.info("MIN_LATIN_WORDS: %d", MIN_LATIN_WORDS)
+    logging.info("ENGLISH_DENSITY_THRESHOLD: %.2f", ENGLISH_DENSITY_THRESHOLD)
+    logging.info("LINGUA_ENGLISH_THRESHOLD: %.2f", LINGUA_ENGLISH_THRESHOLD)
+    logging.info("LINGUA_SPANISH_THRESHOLD: %.2f", LINGUA_SPANISH_THRESHOLD)
+    logging.info("LINGUA_MIN_RELATIVE_DISTANCE: %.2f", LINGUA_MIN_RELATIVE_DISTANCE)
+    logging.info("LINGUA_LOW_MEMORY: %s", LINGUA_LOW_MEMORY)
+    logging.info("----------------------------")
 
     lang_filter = NepaliFilter(
         english_threshold=LINGUA_ENGLISH_THRESHOLD,
