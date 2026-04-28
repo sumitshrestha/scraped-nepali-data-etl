@@ -303,10 +303,19 @@ def process_file(
         return 0, 0, 0
 
     total = kept = discarded = 0
+    LOG_EVERY = 10_000  # print a progress line every this many messages
 
     try:
         for msg in _stream_messages(path):
             total += 1
+
+            if total % LOG_EVERY == 0:
+                logging.info(
+                    "  ... %s messages scanned | %d kept | %d discarded",
+                    f"{total:,}",
+                    kept,
+                    discarded,
+                )
 
             # System messages
             if msg.get("type") in _SYSTEM_MESSAGE_TYPES:
