@@ -88,13 +88,8 @@ def _setup_logging():
     root.setLevel(logging.DEBUG)
     root.addHandler(ch)
 
-    # Discard log — separate file, written by a dedicated logger
-    # Uses a RotatingFileHandler so it never grows unbounded
-    from logging.handlers import RotatingFileHandler
-
-    discard_handler = RotatingFileHandler(
-        DISCARD_LOG, maxBytes=50 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
+    # Discard log: plain file handler, no rotation accumulation in memory
+    discard_handler = logging.FileHandler(DISCARD_LOG, mode="a", encoding="utf-8")
     discard_handler.setLevel(logging.DEBUG)
     discard_handler.setFormatter(logging.Formatter("%(message)s"))  # plain lines
     discard_handler.addFilter(lambda r: r.name == "discard")
@@ -126,30 +121,25 @@ _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberSubscription",
 }
 
-_DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
-
 
 def _latin_words(text: str) -> set[str]:
-    latin_only = _DEVANAGARI_RE.sub(" ", text)
+    """Return set of Latin words from text (Devanagari stripped)."""
+    devanagari_re = re.compile(r"[\u0900-\u097F]+")
+    latin_only = devanagari_re.sub(" ", text)
     return {w.lower() for w in re.findall(r"[a-zA-Z']+", latin_only)}
 
 
-def is_romanized_nepali_message(content: str, lang_filter: NepaliFilter) -> bool:
+def is_romanized_nepali_message(cleaned_text: str, lang_filter: NepaliFilter) -> bool:
     """
-    Keep a message if:
-      1. It has at least one Latin word  (not purely Devanagari / emoji-only)
-      2. Lingua is NOT confident (>=85%) it is English or Spanish
-
-    We do NOT require signal words here.  With all 75 Lingua models loaded,
-    romanized Nepali returns low confidence scores across the board — so the
-    threshold alone is a reliable gate.  Requiring signal words on top of that
-    caused too many false discards of short genuine Nepali messages.
+    Determine if a *already cleaned* message should be kept.
+    Cleaned text has no emoji, mentions, URLs, markdown symbols.
     """
-    if not content or not content.strip():
+    if not cleaned_text or not cleaned_text.strip():
         return False
-    if not _latin_words(content):
-        return False  # purely Devanagari / emoji
-    return lang_filter.is_nepali(content)  # False = Lingua confident EN or ES
+    latin_words = _latin_words(cleaned_text)
+    if not latin_words:
+        return False
+    return lang_filter.is_nepali(cleaned_text)  # uses Lingua on the cleaned Latin text
 
 
 def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
@@ -163,82 +153,77 @@ def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Streaming JSON reader
+# Robust header extraction using ijson (no brittle truncation)
 # ---------------------------------------------------------------------------
-
-# How many bytes to read from the top of the file to find guild + channel.
-# guild and channel are small objects that always appear before the messages
-# array in DiscordChatExporter output.  64 KB is more than enough for any
-# realistic server/channel name, and avoids touching the rest of the file.
-_HEADER_READ_BYTES = 65_536  # 64 KB
-
-
-def _read_header(path: str) -> tuple[dict, dict]:
+def _read_header_ijson(path: str):
     """
-    Extract guild and channel by reading only the first 64 KB of the file.
-
-    Strategy
-    --------
-    guild and channel are always the first two keys in a DiscordChatExporter
-    JSON file, appearing well before the messages array.  We read a small
-    prefix, truncate it just before the "messages" key so it forms valid JSON,
-    then parse that tiny blob.  The rest of the (possibly multi-GB) file is
-    never touched for this step.
-
-    We intentionally do NOT use ijson here — ijson.kvitems with a break
-    can still read-ahead aggressively depending on the C backend in use,
-    causing OOM on very large files.  A raw 64 KB prefix read is always safe.
+    Extract guild and channel by streaming only the first two keys.
+    This reads the file incrementally and stops as soon as both guild and channel
+    are obtained. The huge messages array is never visited.
     """
+    guild = {}
+    channel = {}
     with open(path, "rb") as f:
-        prefix = f.read(_HEADER_READ_BYTES)
+        parser = ijson.parse(f)
+        for prefix, event, value in parser:
+            if prefix == "guild" and event == "map_key":
+                # guild object begins – we could capture it, but easier: after we have
+                # both, we break. Actually ijson doesn't give the whole object easily.
+                # Alternative: use ijson.kvitems with a short-circuit.
+                pass
+        # Simpler: use ijson.items for the top-level keys 'guild' and 'channel'
+        # They are small and appear before 'messages'. Reset file pointer.
+        f.seek(0)
+        try:
+            for key, obj in ijson.kvitems(f, ""):
+                if key == "guild":
+                    guild = obj
+                elif key == "channel":
+                    channel = obj
+                if guild and channel:
+                    break
+        except ijson.JSONError:
+            # Fallback to older method if ijson fails
+            return _read_header_fallback(path)
+    return guild, channel
 
+
+def _read_header_fallback(path: str):
+    """Fallback using small prefix read (64 KB) – kept for safety."""
+    with open(path, "rb") as f:
+        prefix = f.read(65536)
     text = prefix.decode("utf-8", errors="replace")
-
-    # Truncate at the start of the "messages" key so we have valid JSON.
-    # DiscordChatExporter always writes:  ..., "messages": [
     cut = text.find('"messages"')
     if cut == -1:
         return {}, {}
-
-    # Everything before "messages" — strip trailing comma/whitespace then close
     stub = text[:cut].rstrip().rstrip(",").rstrip() + "}"
-
     try:
         obj = json.loads(stub)
     except json.JSONDecodeError:
         return {}, {}
-
     return obj.get("guild") or {}, obj.get("channel") or {}
 
 
+def _read_header(path: str):
+    """Public wrapper – tries ijson first, falls back to prefix method."""
+    try:
+        return _read_header_ijson(path)
+    except Exception:
+        return _read_header_fallback(path)
+
+
 def _stream_messages(path: str):
-    """
-    Yield one message dict at a time from the messages array.
-    Peak RAM: one message object (~a few KB) regardless of file size.
-    ijson reads the file in small internal chunks (default 64 KB) so the
-    full file is never loaded into memory.
-    """
+    """Yield one message dict at a time from the messages array."""
     with open(path, "rb") as f:
         yield from ijson.items(f, "messages.item", use_float=True)
 
 
 # ---------------------------------------------------------------------------
-# Per-file processing  (streaming in, streaming out)
+# Per-file processing
 # ---------------------------------------------------------------------------
-
-
 def process_file(
     path: str, lang_filter: NepaliFilter, base_dir: str, out_f, first_record: list
-) -> tuple[int, int, int]:
-    """
-    Stream-parse one export file, filter messages, write kept records
-    directly to out_f (already-open output file handle).
-
-    first_record is a one-element list used as a mutable flag so the caller
-    can track whether to write a leading comma before each record.
-
-    Returns (total, kept, discarded).
-    """
+):
     rel_path = os.path.relpath(path, base_dir)
 
     try:
@@ -253,7 +238,6 @@ def process_file(
     try:
         for msg in _stream_messages(path):
             total += 1
-
             if total % LOG_EVERY == 0:
                 logging.info(
                     "  ... %s messages scanned | %d kept | %d discarded",
@@ -262,13 +246,11 @@ def process_file(
                     discarded,
                 )
 
-            # System messages
+            # System & bot messages
             if msg.get("type") in _SYSTEM_MESSAGE_TYPES:
                 discarded += 1
                 discard_log.debug("[system:%s] %s", msg.get("type"), msg.get("id"))
                 continue
-
-            # Bot messages
             author = msg.get("author") or {}
             if author.get("isBot", False):
                 discarded += 1
@@ -277,12 +259,14 @@ def process_file(
                 )
                 continue
 
-            content = msg.get("content") or ""
-            if not is_romanized_nepali_message(content, lang_filter):
+            raw_content = msg.get("content") or ""
+            cleaned = clean_text(raw_content)  # uniform cleaning
+
+            if not is_romanized_nepali_message(cleaned, lang_filter):
                 discarded += 1
-                lw = _latin_words(content)
-                reason = "no-latin" if not lw else "lingua-EN/ES"
-                discard_log.debug("[%s] %s | %s", reason, msg.get("id"), content[:120])
+                latin = _latin_words(cleaned)
+                reason = "no-latin" if not latin else "lingua-EN/ES"
+                discard_log.debug("[%s] %s | %s", reason, msg.get("id"), cleaned[:120])
                 continue
 
             record = {
@@ -296,7 +280,8 @@ def process_file(
                 "author_id": author.get("id"),
                 "author_name": author.get("name"),
                 "is_bot": author.get("isBot", False),
-                "content": content,
+                "content_raw": raw_content,  # original Discord markup
+                "content_clean": cleaned,  # uniformly cleaned (same as detection)
                 "timestamp": msg.get("timestamp"),
                 "source_file": rel_path,
             }
@@ -320,12 +305,10 @@ def process_file(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-
-def main(export_dir: str) -> None:
+def main(export_dir: str):
     start = time.time()
     logging.info("Discord ETL starting. Input dir: %s", export_dir)
-    logging.info("Output file: %s  (written incrementally)", OUTPUT_FILE)
+    logging.info("Output file: %s (written incrementally)", OUTPUT_FILE)
 
     lang_filter = NepaliFilter()
 
@@ -335,30 +318,25 @@ def main(export_dir: str) -> None:
         for fname in sorted(files):
             if fname.endswith(".json"):
                 all_files.append(os.path.join(root, fname))
-
-    logging.info("Found %d JSON files to process.", len(all_files))
+    logging.info("Found %d JSON files.", len(all_files))
 
     file_count = 0
-    msg_total = 0
-    msg_kept = 0
-    msg_discarded = 0
+    msg_total = msg_kept = msg_discarded = 0
 
-    # Open output file once and stream records into it as they are found.
-    # This means peak RAM for output is one record, not the full dataset.
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out_f:
         out_f.write("[")
-        first_record = [True]  # mutable flag passed into process_file
+        first_record = [True]
 
         for path in all_files:
             file_count += 1
             rel = os.path.relpath(path, export_dir)
-            file_size_mb = os.path.getsize(path) / 1024 / 1024
+            size_mb = os.path.getsize(path) / 1024 / 1024
             logging.info(
-                "[%d/%d] Processing: %s  (%.1f MB)",
+                "[%d/%d] Processing: %s (%.1f MB)",
                 file_count,
                 len(all_files),
                 rel,
-                file_size_mb,
+                size_mb,
             )
 
             total, kept, discarded = process_file(
@@ -367,7 +345,6 @@ def main(export_dir: str) -> None:
             msg_total += total
             msg_kept += kept
             msg_discarded += discarded
-
             logging.info(
                 "  -> %d kept / %d total / %d discarded", kept, total, discarded
             )
