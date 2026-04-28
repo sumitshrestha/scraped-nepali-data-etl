@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Generate a JSON Schema from a large JSON file, handling:
-- Top-level array of objects
-- Single large object
-- Line-delimited JSON (one object per line)
+Generate JSON Schema from large JSON files of any structure:
+- Array of objects
+- Single huge object
+- Line-delimited JSON
 """
 
 import ijson
 import json
 import sys
 from collections import defaultdict
-from typing import Any, Dict, Optional
+from typing import Dict, Optional, Any
 
 # ----------------------------------------------------------------------
-# Type inference and merging (same as before)
+# Type inference and merging
 # ----------------------------------------------------------------------
 
 
@@ -42,17 +42,6 @@ def _merge_types(existing: Optional[str], new: str) -> str:
         idx_new = hierarchy.index(new)
         return hierarchy[max(idx_ex, idx_new)]
     return "string"
-
-
-def _array_item_type(arr: list) -> str:
-    for elem in arr:
-        if elem is not None:
-            if isinstance(elem, dict):
-                return "object"
-            if isinstance(elem, list):
-                return "array"
-            return _primitive_type(elem)
-    return "null"
 
 
 def _merge_array_schema(
@@ -101,45 +90,53 @@ def _merge_object_schemas(existing_props: Dict, new_props: Dict) -> Dict:
                     existing_schema, new_schema["items"]["type"], new_schema["items"]
                 )
             else:
-                unified_type = _merge_types(existing_type, new_type)
-                result[key] = {"type": unified_type}
+                result[key] = {"type": _merge_types(existing_type, new_type)}
     return result
 
 
-def _update_schema_and_counts(
-    schema_node: Dict, obj: Any, field_counts: Dict[str, int], path: str = ""
+def _update_schema_with_object(
+    schema_props: Dict, obj: Dict, field_counts: Dict[str, int], path: str = ""
 ):
+    """Update schema and counts from a full object (used for arrays or line‑delimited)."""
     if not isinstance(obj, dict):
         return
     for key, value in obj.items():
         full_path = f"{path}.{key}" if path else key
         field_counts[full_path] += 1
         if isinstance(value, dict):
-            if "properties" not in schema_node.get(key, {}):
-                schema_node[key] = {"type": "object", "properties": {}}
-            _update_schema_and_counts(
-                schema_node[key]["properties"], value, field_counts, full_path
+            if "properties" not in schema_props.get(key, {}):
+                schema_props[key] = {"type": "object", "properties": {}}
+            _update_schema_with_object(
+                schema_props[key]["properties"], value, field_counts, full_path
             )
         elif isinstance(value, list):
-            item_type = _array_item_type(value)
+            item_type = (
+                "object"
+                if (value and isinstance(value[0], dict))
+                else (
+                    "array"
+                    if (value and isinstance(value[0], list))
+                    else (_primitive_type(value[0]) if value else "null")
+                )
+            )
             item_schema = None
             if item_type == "object" and value and isinstance(value[0], dict):
                 item_schema = {"type": "object", "properties": {}}
-                _update_schema_and_counts(
+                _update_schema_with_object(
                     item_schema["properties"], value[0], field_counts, full_path
                 )
-            if key not in schema_node:
-                schema_node[key] = {"type": "array"}
-            schema_node[key] = _merge_array_schema(
-                schema_node.get(key), item_type, item_schema
+            if key not in schema_props:
+                schema_props[key] = {"type": "array"}
+            schema_props[key] = _merge_array_schema(
+                schema_props.get(key), item_type, item_schema
             )
         else:
             prim_type = _primitive_type(value)
-            if key not in schema_node:
-                schema_node[key] = {"type": prim_type}
+            if key not in schema_props:
+                schema_props[key] = {"type": prim_type}
             else:
-                existing_type = schema_node[key].get("type")
-                schema_node[key] = {"type": _merge_types(existing_type, prim_type)}
+                existing_type = schema_props[key].get("type")
+                schema_props[key] = {"type": _merge_types(existing_type, prim_type)}
 
 
 def _add_required_fields(
@@ -170,12 +167,171 @@ def _add_required_fields(
 
 
 # ----------------------------------------------------------------------
-# Detection and adaptive parsing
+# Streaming for a single huge object using ijson.parse
+# ----------------------------------------------------------------------
+
+
+def _stream_schema_from_single_object(file_path: str, max_samples: int = 10000) -> Dict:
+    """
+    Traverse a huge JSON object using ijson.parse, sampling at most `max_samples`
+    primitive values to build the schema incrementally.
+    """
+    schema = {"type": "object", "properties": {}}
+    # We need a map from path to current type and a count of occurrences
+    # Instead of full counts, we just need to know if a field appears in all
+    # sampled objects – but here we have only *one* logical object,
+    # so "required" will include all fields that appear up to the sample limit.
+    # For simplicity, we treat each unique path as required if it appears.
+    field_occurrences = defaultdict(int)
+
+    with open(file_path, "rb") as f:
+        parser = ijson.parse(f)
+        # Stack to track current path segments (list of keys/indexes)
+        path_stack = []
+        # For arrays, we need to know the current array element index (not used for schema)
+        # We'll build a dictionary representation of the schema incrementally.
+        # We'll maintain a reference to the current schema node as we go deep.
+        # This is complex; instead we'll collect field paths and types,
+        # then construct the schema after sampling.
+        # Simpler: record every field path we encounter and its type,
+        # then rebuild the nested object structure later.
+        sample_count = 0
+        field_types = {}  # path -> merged type
+        for prefix, event, value in parser:
+            if sample_count >= max_samples:
+                break
+            if event == "map_key":
+                path_stack.append(value)  # push key
+            elif event == "start_map":
+                pass  # nothing extra
+            elif event == "end_map":
+                if path_stack:
+                    path_stack.pop()
+            elif event == "start_array":
+                path_stack.append("[]")  # mark array position
+            elif event == "end_array":
+                if path_stack and path_stack[-1] == "[]":
+                    path_stack.pop()
+            elif event in ("number", "string", "boolean", "null"):
+                # primitive value
+                full_path = ".".join(str(p) for p in path_stack if p != "[]")
+                if full_path:
+                    # For simplicity, we ignore array element indexing
+                    # and treat the whole array as a generic array.
+                    # We'll handle arrays separately: record that this path is an array,
+                    # and the primitive type is the element type.
+                    # But events for array elements: the path includes '[]' as a placeholder.
+                    # We can detect if the last segment is '[]' -> this is an array element.
+                    if path_stack and path_stack[-1] == "[]":
+                        # This is an array element. We need to store the array path
+                        # and the element type.
+                        array_path = ".".join(
+                            str(p) for p in path_stack[:-1] if p != "[]"
+                        )
+                        elem_type = _primitive_type(value)
+                        # For arrays, we treat the schema as array with items type
+                        # We'll store a special marker
+                        field_types[f"{array_path}[]"] = elem_type
+                    else:
+                        # Regular object field
+                        prim_type = _primitive_type(value)
+                        if full_path in field_types:
+                            field_types[full_path] = _merge_types(
+                                field_types[full_path], prim_type
+                            )
+                        else:
+                            field_types[full_path] = prim_type
+                sample_count += 1
+            elif event == "start_array":
+                # Already handled above for path
+                continue
+
+    # Convert collected flat field types into nested JSON Schema
+    schema_props = {}
+    for path, typ in field_types.items():
+        if path.endswith("[]"):
+            # Array field
+            array_path = path[:-2]
+            parts = array_path.split(".") if array_path else []
+            current = schema_props
+            for i, part in enumerate(parts):
+                if part not in current:
+                    if i == len(parts) - 1:
+                        # This is where the array lives
+                        current[part] = {"type": "array", "items": {"type": typ}}
+                    else:
+                        current[part] = {"type": "object", "properties": {}}
+                current = (
+                    current[part].get("properties", current[part])
+                    if i < len(parts) - 1
+                    else current[part]
+                )
+            # For the array, ensure items type
+            if parts:
+                last = parts[-1]
+                current[last]["items"]["type"] = typ
+        else:
+            # Regular field
+            parts = path.split(".")
+            current = schema_props
+            for i, part in enumerate(parts):
+                if part not in current:
+                    if i == len(parts) - 1:
+                        current[part] = {"type": typ}
+                    else:
+                        current[part] = {"type": "object", "properties": {}}
+                if isinstance(current[part], dict) and i < len(parts) - 1:
+                    current = current[part].setdefault("properties", {})
+                elif i < len(parts) - 1:
+                    # Should be object with properties
+                    if "properties" not in current[part]:
+                        current[part]["properties"] = {}
+                    current = current[part]["properties"]
+                else:
+                    # leaf
+                    pass
+
+    # Mark all fields as required (since a single object, any field that appears is required)
+    def mark_required(node):
+        if node.get("type") == "object" and "properties" in node:
+            node["required"] = list(node["properties"].keys())
+            for subnode in node["properties"].values():
+                mark_required(subnode)
+        elif (
+            node.get("type") == "array"
+            and "items" in node
+            and node["items"].get("type") == "object"
+        ):
+            mark_required(node["items"])
+
+    mark_required({"type": "object", "properties": schema_props})
+
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "title": "Schema inferred from single huge object (streaming)",
+        "type": "object",
+        "properties": schema_props,
+        "required": list(schema_props.keys()),
+    }
+
+
+def _schema_from_single_object_streaming(
+    file_path: str, sample_size: int = 100
+) -> Dict:
+    """
+    Public entry point for a single huge JSON object.
+    Uses streaming ijson.parse with limited sample size.
+    """
+    # sample_size here means number of primitive values to sample
+    return _stream_schema_from_single_object(file_path, max_samples=sample_size)
+
+
+# ----------------------------------------------------------------------
+# Detection and dispatching
 # ----------------------------------------------------------------------
 
 
 def _peek_first_char(file_path: str) -> str:
-    """Return the first non‑whitespace character from the file."""
     with open(file_path, "rb") as f:
         while True:
             ch = f.read(1)
@@ -186,24 +342,21 @@ def _peek_first_char(file_path: str) -> str:
 
 
 def generate_schema(file_path: str, sample_size: int = 100) -> Dict:
-    """
-    Auto‑detect the JSON structure and generate a JSON Schema.
-    """
     first_char = _peek_first_char(file_path)
     if first_char == "[":
         # Top-level array
         return _schema_from_array(file_path, sample_size)
     elif first_char == "{":
-        # Single object
-        return _schema_from_single_object(file_path, sample_size)
+        # Single huge object – use streaming parser
+        return _schema_from_single_object_streaming(file_path, sample_size)
     else:
-        # Try line-delimited JSON (each line is a JSON object)
-        try:
-            return _schema_from_line_delimited(file_path, sample_size)
-        except Exception as e:
-            raise ValueError(
-                f"File does not appear to be a JSON array, object, or line-delimited JSON: {e}"
-            )
+        # Try line-delimited JSON
+        return _schema_from_line_delimited(file_path, sample_size)
+
+
+# ----------------------------------------------------------------------
+# Implementations for array and line-delimited (same as before, with minor fixes)
+# ----------------------------------------------------------------------
 
 
 def _schema_from_array(file_path: str, sample_size: int) -> Dict:
@@ -215,7 +368,7 @@ def _schema_from_array(file_path: str, sample_size: int) -> Dict:
         for obj in objects:
             if total >= sample_size:
                 break
-            _update_schema_and_counts(schema["properties"], obj, field_counts)
+            _update_schema_with_object(schema["properties"], obj, field_counts)
             total += 1
         if total == 0:
             raise ValueError("The JSON array is empty.")
@@ -223,54 +376,7 @@ def _schema_from_array(file_path: str, sample_size: int) -> Dict:
         return _wrap_schema(schema, f"Array of objects (sampled {total})")
 
 
-def _schema_from_single_object(file_path: str, sample_size: int) -> Dict:
-    with open(file_path, "rb") as f:
-        # Stream key-value pairs from the root object
-        items = ijson.kvitems(f, "")
-        schema = {"type": "object", "properties": {}}
-        field_counts = defaultdict(int)
-        total = 0
-        # Since it's a single object, we cannot "sample" objects – we have to take the whole object.
-        # But we can limit the number of key-value pairs if the object has millions of keys?
-        # For a huge object, we'll sample the first `sample_size` keys.
-        for key, value in items:
-            if total >= sample_size:
-                break
-            # Treat each top-level key as a separate object? No, it's a single object.
-            # We need to update schema with this single object.
-            # However, kvitems yields each (key, value). We'll collect them into a temporary dict.
-            # Simpler: treat as one object, but we may need to sample inside large nested structures.
-            # We'll just parse the whole object using ijson? That could be heavy. Alternative:
-            # Use ijson to parse only the first N bytes? Not reliable.
-            # Instead, we'll use a different approach: use ijson.items with prefix '' to get the whole object,
-            # but that loads everything. For a truly massive single object, consider using ijson.parse
-            # and building schema on-the-fly. However, for practicality, we assume a single object fits
-            # in memory or we sample its top-level keys.
-            # We'll implement a streaming traversal of the first `sample_size` top-level keys only.
-            # For each key, we recursively walk its value, but only up to a depth? This is complex.
-            # A simpler heuristic: if it's a single object, it's probably not too huge (otherwise line-delimited is better).
-            # We'll just load the whole object using standard json.load() – but that defeats the purpose.
-            # For large single objects, the user should use line-delimited format.
-            # We'll compromise: use ijson to parse the whole object but stop after a certain number of bytes?
-            # That's not reliable.
-            raise NotImplementedError(
-                "Single object parsing with sampling is not fully implemented yet. Please convert to array of objects or line-delimited JSON."
-            )
-        # For now, we'll fallback to reading the whole object (not recommended for huge files)
-        # But let's provide a fallback that works for moderately large objects:
-        import json
-
-        with open(file_path, "r") as f2:
-            obj = json.load(f2)
-        schema = {"type": "object", "properties": {}}
-        field_counts = defaultdict(int)
-        _update_schema_and_counts(schema["properties"], obj, field_counts)
-        _add_required_fields(schema, field_counts, 1)
-        return _wrap_schema(schema, "Single object")
-
-
 def _schema_from_line_delimited(file_path: str, sample_size: int) -> Dict:
-    """Each line is a JSON object."""
     schema = {"type": "object", "properties": {}}
     field_counts = defaultdict(int)
     total = 0
@@ -282,31 +388,27 @@ def _schema_from_line_delimited(file_path: str, sample_size: int) -> Dict:
             try:
                 obj = json.loads(line)
                 if not isinstance(obj, dict):
-                    # If a line is not an object, we can still include it? For simplicity, skip.
                     continue
                 if total >= sample_size:
                     break
-                _update_schema_and_counts(schema["properties"], obj, field_counts)
+                _update_schema_with_object(schema["properties"], obj, field_counts)
                 total += 1
             except json.JSONDecodeError:
-                # Skip malformed lines (or raise, depending on strictness)
                 continue
     if total == 0:
-        raise ValueError("No valid JSON objects found in the line-delimited file.")
+        raise ValueError("No valid JSON objects found in line-delimited file.")
     _add_required_fields(schema, field_counts, total)
     return _wrap_schema(schema, f"Line‑delimited objects (sampled {total})")
 
 
-def _wrap_schema(properties: Dict, description: str) -> Dict:
+def _wrap_schema(schema_node: Dict, description: str) -> Dict:
     return {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "title": "Inferred JSON Schema",
         "description": description,
         "type": "object",
-        "properties": properties.get(
-            "properties", properties
-        ),  # properties might already be under "properties"
-        "required": properties.get("required", []),
+        "properties": schema_node.get("properties", schema_node),
+        "required": schema_node.get("required", []),
     }
 
 
@@ -322,7 +424,7 @@ def main():
         "--sample-size",
         type=int,
         default=100,
-        help="Number of objects/keys to sample (default: 100)",
+        help="Number of objects/primitive values to sample (default: 100)",
     )
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
     args = parser.parse_args()
