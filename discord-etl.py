@@ -436,23 +436,31 @@ def is_romanized_nepali_message(
     docstring for the reasoning around threshold differences between ETLs.
     """
     if not cleaned_text or not cleaned_text.strip():
+        discard_log.debug("[empty] %r", cleaned_text)
         return False, "empty"
 
     words = _latin_words(cleaned_text)
 
     if not words:
+        discard_log.debug("[no-latin] %r", cleaned_text)
         return False, "no-latin"
 
     if len(words) < MIN_LATIN_WORDS:
+        discard_log.debug(
+            f"[too-short({len(words)}<{MIN_LATIN_WORDS})] %r", cleaned_text
+        )
         return False, f"too-short({len(words)}<{MIN_LATIN_WORDS})"
 
     if _is_high_english_density(words):
+        discard_log.debug("[en-density] %r", cleaned_text)
         return False, "en-density"
 
     if lang_filter.is_english(cleaned_text):
+        discard_log.debug("[lingua-EN] %r", cleaned_text)
         return False, "lingua-EN"
 
     if lang_filter.is_spanish(cleaned_text):
+        discard_log.debug("[lingua-ES] %r", cleaned_text)
         return False, "lingua-ES"
 
     return True, ""
