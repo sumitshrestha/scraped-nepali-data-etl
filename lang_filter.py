@@ -75,19 +75,18 @@ log = logging.getLogger(__name__)
 # Discord / Reddit markup noise removed before language detection.
 # Order matters: remove structured tokens first, then loose punctuation.
 _CLEAN_PATTERNS = [
-    # Discord: animated custom emoji  <a:name:id>
+    # Discord: animated custom emoji
     (re.compile(r"<a:[^:>]+:\d+>"), ""),
-    # Discord: static custom emoji    <:name:id>
     (re.compile(r"<:[^:>]+:\d+>"), ""),
-    # Discord: user / role mentions   <@123>  <@!123>  <@&123>
     (re.compile(r"<@[!&]?\d+>"), ""),
-    # Discord: channel mentions       <#123>
     (re.compile(r"<#\d+>"), ""),
-    # Shortcode emoji   :word:  :word_word:
+    # @mentions (plain text)
+    (re.compile(r"@[\w.]+"), ""),
+    # Shortcode emoji
     (re.compile(r":[A-Za-z0-9_]{2,32}:"), ""),
     # URLs
     (re.compile(r"https?://\S+|ftp://\S+", re.I), ""),
-    # Unicode emoji — emoticons, symbols, dingbats, variation selectors
+    # Unicode emoji
     (
         re.compile(
             "[\U0001f300-\U0001faff"
@@ -99,9 +98,9 @@ _CLEAN_PATTERNS = [
         ),
         "",
     ),
-    # Decorative separators   ⎯⎯⎯  ———  ===  ~~~
+    # Decorative separators
     (re.compile(r"[-=_~*\u23AF\u2014]{3,}"), ""),
-    # Markdown bold/italic remnants  ** __ * _
+    # Markdown symbols (bold, italic, etc.)
     (re.compile(r"\*{1,3}|_{1,2}"), ""),
     # Collapse whitespace
     (re.compile(r"\s+"), " "),

@@ -136,10 +136,16 @@ def is_romanized_nepali_message(cleaned_text: str, lang_filter: NepaliFilter) ->
     """
     if not cleaned_text or not cleaned_text.strip():
         return False
-    latin_words = _latin_words(cleaned_text)
-    if not latin_words:
+    if not _latin_words(cleaned_text):
         return False
-    return lang_filter.is_nepali(cleaned_text)  # uses Lingua on the cleaned Latin text
+       
+    
+    # Otherwise discard if English or Spanish with threshold 0.5
+    if lang_filter.is_english(cleaned_text, threshold=0.5):
+        return False
+    if lang_filter.is_spanish(cleaned_text, threshold=0.5):
+        return False
+    return True
 
 
 def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
