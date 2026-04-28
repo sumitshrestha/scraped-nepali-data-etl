@@ -68,7 +68,7 @@ from dotenv import load_dotenv
 
 import ijson
 
-from lang_filter import NepaliFilter
+from lang_filter import NepaliFilter, clean_text
 
 load_dotenv()
 

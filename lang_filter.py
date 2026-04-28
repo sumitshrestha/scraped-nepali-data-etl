@@ -11,11 +11,11 @@ and discards text that is confidently English or confidently Spanish.
 
 Design decisions
 ----------------
-* Lingua is loaded with ALL 75 language models rather than a small subset.
-  With more languages to compare against, Lingua returns genuinely low
-  confidence for romanized Nepali (which is not a recognised lingua language),
-  making it a reliable "keep" signal.  A 3-language subset would force Lingua
-  to pick the least-wrong option and produce false discards.
+* Lingua is loaded with all 75 language models by default (~1 GB RAM).
+  On machines with <1.2 GB free RAM it automatically falls back to loading
+  only English, Spanish, and Nepali models (~50 MB).  You can also pass
+  low_memory=True explicitly.  The three-language subset is slightly less
+  accurate on edge cases but covers exactly the languages being filtered.
 
 * Only the Latin portion of text is sent to Lingua.  Devanagari characters
   are stripped first so mixed-script text like "yo song राम्रो cha" is
@@ -48,6 +48,11 @@ Public API
     f.is_english("yo dai kasto cha")                 # False — not English
     f.is_spanish("hola que tal")                     # True  — Spanish
 
+    # Text cleaning (strip Discord/Reddit noise before detection)
+    from lang_filter import clean_text
+    clean_text("<@123> bro kasto xa? 🍑")      # "bro kasto xa?"
+    clean_text(":JN_sadpuff: haha lol")         # "haha lol"
+
     # Convenience module-level function
     from lang_filter import is_nepali
     is_nepali("yo dai ramro cha")              # True
@@ -62,6 +67,75 @@ import logging
 from lingua import Language, LanguageDetectorBuilder
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Text cleaning
+# ---------------------------------------------------------------------------
+
+# Discord / Reddit markup noise removed before language detection.
+# Order matters: remove structured tokens first, then loose punctuation.
+_CLEAN_PATTERNS = [
+    # Discord: animated custom emoji  <a:name:id>
+    (re.compile(r"<a:[^:>]+:\d+>"), ""),
+    # Discord: static custom emoji    <:name:id>
+    (re.compile(r"<:[^:>]+:\d+>"), ""),
+    # Discord: user / role mentions   <@123>  <@!123>  <@&123>
+    (re.compile(r"<@[!&]?\d+>"), ""),
+    # Discord: channel mentions       <#123>
+    (re.compile(r"<#\d+>"), ""),
+    # Shortcode emoji   :word:  :word_word:
+    (re.compile(r":[A-Za-z0-9_]{2,32}:"), ""),
+    # URLs
+    (re.compile(r"https?://\S+|ftp://\S+", re.I), ""),
+    # Unicode emoji — emoticons, symbols, dingbats, variation selectors
+    (
+        re.compile(
+            "[\U0001f300-\U0001faff"
+            "\U00002702-\U000027b0"
+            "\U0000fe00-\U0000fe0f"
+            "\U00002500-\U00002bef"
+            "\U00010000-\U0010ffff]+",
+            re.UNICODE,
+        ),
+        "",
+    ),
+    # Decorative separators   ⎯⎯⎯  ———  ===  ~~~
+    (re.compile(r"[-=_~*\u23AF\u2014]{3,}"), ""),
+    # Markdown bold/italic remnants  ** __ * _
+    (re.compile(r"\*{1,3}|_{1,2}"), ""),
+    # Collapse whitespace
+    (re.compile(r"\s+"), " "),
+]
+
+
+def clean_text(text: str) -> str:
+    """
+    Remove Discord / Reddit markup noise before language detection.
+
+    Strips in order:
+      - Discord custom emoji    <:name:id>  <a:name:id>
+      - Discord mentions        <@123>  <#123>
+      - Shortcode emoji         :JN_sadpuff:
+      - URLs                    https://...
+      - Unicode emoji           🍑 😔 🌿
+      - Decorative separators   ⎯⎯⎯  ———
+      - Markdown remnants       ** __ * _
+      - Extra whitespace
+
+    The cleaned text is used ONLY for language detection — the original
+    unmodified text is always what gets written to the output file.
+
+    Examples
+    --------
+      "<@1234> bro kasto xa? 🍑🍑"   →  "bro kasto xa?"
+      ":JN_sadpuff: haha lol"          →  "haha lol"
+      "check https://t.co/abc out"     →  "check out"
+      "⎯⎯⎯ MAIN ✨ ⎯⎯⎯ welcome"      →  "MAIN welcome"
+    """
+    for pattern, replacement in _CLEAN_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text.strip()
+
 
 # ---------------------------------------------------------------------------
 # Internal regex helpers
@@ -90,7 +164,9 @@ class NepaliFilter:
     """
     Stateful filter that wraps a Lingua detector.
 
-    Creating an instance loads all Lingua language models into memory (~1 GB).
+    Creating an instance loads Lingua language models into memory.
+    By default all 75 models (~1 GB) are loaded; pass low_memory=True or
+    have <1.2 GB free RAM to load only EN+ES+NE models (~50 MB) instead.
     Instantiate once and reuse across your entire scrape run — do not create
     a new instance per comment or post.
 
@@ -101,15 +177,61 @@ class NepaliFilter:
         discarded as English or Spanish.  Default 0.85 (strict / conservative).
     """
 
-    def __init__(self, threshold: float = 0.85) -> None:
+    def __init__(self, threshold: float = 0.85, low_memory: bool = False) -> None:
+        """
+        Parameters
+        ----------
+        threshold : float
+            Confidence level above which a comment is discarded as EN or ES.
+        low_memory : bool
+            When True, load only English, Spanish, and Nepali models (~50 MB)
+            instead of all 75 (~1 GB).  Use this on machines with <1.5 GB free
+            RAM (e.g. a local laptop or small VPS).  Detection accuracy is
+            slightly lower for edge cases, but the three-language subset covers
+            exactly the languages you need to filter, so results remain good.
+            Detected automatically when available RAM < 1.2 GB.
+        """
         self.threshold = threshold
-        log.info("NepaliFilter: loading Lingua detector (all 75 languages)...")
-        self._detector = (
-            LanguageDetectorBuilder.from_all_languages()
-            .with_minimum_relative_distance(0.1)  # need ≥10% gap between top-2
-            .build()
+
+        # Auto-detect memory pressure if caller didn't specify
+        if not low_memory:
+            try:
+                import psutil
+
+                free_gb = psutil.virtual_memory().available / 1024**3
+                if free_gb < 1.2:
+                    low_memory = True
+                    log.warning(
+                        "NepaliFilter: only %.1f GB RAM available — "
+                        "switching to low_memory mode (EN+ES+NE models only).",
+                        free_gb,
+                    )
+            except ImportError:
+                pass  # psutil not installed — trust caller's choice
+
+        if low_memory:
+            log.info("NepaliFilter: loading Lingua detector (EN, ES, NE only)...")
+            self._detector = (
+                LanguageDetectorBuilder.from_languages(
+                    Language.ENGLISH, Language.SPANISH, Language.NEPALI
+                )
+                .with_minimum_relative_distance(0.1)
+                .build()
+            )
+        else:
+            log.info("NepaliFilter: loading Lingua detector (all 75 languages)...")
+            self._detector = (
+                LanguageDetectorBuilder.from_all_languages()
+                .with_minimum_relative_distance(0.1)
+                .build()
+            )
+
+        mode = "low-memory" if low_memory else "full"
+        log.info(
+            "NepaliFilter: detector ready [%s mode, threshold=%.0f%%].",
+            mode,
+            threshold * 100,
         )
-        log.info("NepaliFilter: detector ready (threshold=%.0f%%).", threshold * 100)
 
     # ------------------------------------------------------------------
     # Low-level helpers (available for callers that need them directly)
@@ -140,8 +262,8 @@ class NepaliFilter:
     def _latin_confidence(
         self, text: str, language: Language, threshold: float
     ) -> bool:
-        """Shared implementation: strip Devanagari, run Lingua, check threshold."""
-        stripped = text.strip()
+        """Shared implementation: clean, strip Devanagari, run Lingua, check threshold."""
+        stripped = clean_text(text)
         if not stripped:
             return False
         latin = _latin_words(stripped)
@@ -164,16 +286,17 @@ class NepaliFilter:
 
         Decision pipeline
         -----------------
-        1. Empty / whitespace only               → DISCARD
-        2. Has Devanagari, zero Latin words      → DISCARD  (purely Devanagari)
-        3. Zero Latin words (emoji / nums only)  → DISCARD
-        4. Run Lingua on the Latin-only portion:
+        1. Clean text (strip emoji, mentions, URLs)  → work on clean version
+        2. Empty / whitespace only               → DISCARD
+        3. Has Devanagari, zero Latin words      → DISCARD  (purely Devanagari)
+        4. Zero Latin words (emoji / nums only)  → DISCARD
+        5. Run Lingua on the Latin-only portion:
                ENGLISH confidence ≥ threshold   → DISCARD
                SPANISH confidence ≥ threshold   → DISCARD
                anything else                    → KEEP
            (Nepali, uncertain, other language → all kept)
         """
-        stripped = text.strip()
+        stripped = clean_text(text)  # strip emoji, mentions, URLs first
 
         # 1. Empty
         if not stripped:
