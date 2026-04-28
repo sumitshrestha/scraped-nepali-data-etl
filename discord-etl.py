@@ -126,118 +126,6 @@ _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberSubscription",
 }
 
-# Grammatically Nepali words that never appear in natural English/Spanish.
-# Proper nouns (Kathmandu, Nepal, Pokhara) intentionally excluded.
-_ROMANIZED_NEPALI_SIGNALS = {
-    "lai",
-    "bata",
-    "sanga",
-    "sang",
-    "bhanda",
-    "vanda",
-    "samma",
-    "dekhi",
-    "tiir",
-    "tira",
-    "pani",
-    "nai",
-    "chai",
-    "ni",
-    "ta",
-    "hai",
-    "hola",
-    "nah",
-    "kei",
-    "kehi",
-    "ekdum",
-    "purai",
-    "ali",
-    "dherai",
-    "yo",
-    "tyo",
-    "yei",
-    "tei",
-    "afu",
-    "afai",
-    "cha",
-    "chha",
-    "chau",
-    "chan",
-    "chhu",
-    "thiyo",
-    "thyo",
-    "thiye",
-    "huncha",
-    "hudaina",
-    "hunu",
-    "hos",
-    "garnu",
-    "garne",
-    "garchan",
-    "garchhu",
-    "gardai",
-    "garyo",
-    "vayo",
-    "bhayo",
-    "vanne",
-    "bhanna",
-    "bhannu",
-    "vayera",
-    "bhayera",
-    "basyo",
-    "aayo",
-    "gayo",
-    "lyayo",
-    "raheko",
-    "rahecha",
-    "gareko",
-    "garera",
-    "gareda",
-    "garda",
-    "herda",
-    "milcha",
-    "milena",
-    "sakcha",
-    "sakina",
-    "manchhe",
-    "manche",
-    "saathi",
-    "aama",
-    "baba",
-    "dai",
-    "didi",
-    "bhai",
-    "bahini",
-    "hajur",
-    "ramro",
-    "sano",
-    "thulo",
-    "mitho",
-    "garo",
-    "dukha",
-    "sukha",
-    "kasto",
-    "kasari",
-    "aaja",
-    "hijo",
-    "bholi",
-    "aaile",
-    "pachi",
-    "agadi",
-    "kahile",
-    "kaha",
-    "kina",
-    "yar",
-    "yaar",
-    "haina",
-    "hoina",
-    "tara",
-    "ani",
-    "ra",
-    "ki",
-    "ka",
-}
-
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
 
 
@@ -247,14 +135,21 @@ def _latin_words(text: str) -> set[str]:
 
 
 def is_romanized_nepali_message(content: str, lang_filter: NepaliFilter) -> bool:
+    """
+    Keep a message if:
+      1. It has at least one Latin word  (not purely Devanagari / emoji-only)
+      2. Lingua is NOT confident (>=85%) it is English or Spanish
+
+    We do NOT require signal words here.  With all 75 Lingua models loaded,
+    romanized Nepali returns low confidence scores across the board — so the
+    threshold alone is a reliable gate.  Requiring signal words on top of that
+    caused too many false discards of short genuine Nepali messages.
+    """
     if not content or not content.strip():
         return False
-    lw = _latin_words(content)
-    if not lw:
+    if not _latin_words(content):
         return False  # purely Devanagari / emoji
-    if not lang_filter.is_nepali(content):
-        return False  # Lingua: confidently EN or ES
-    return bool(lw & _ROMANIZED_NEPALI_SIGNALS)
+    return lang_filter.is_nepali(content)  # False = Lingua confident EN or ES
 
 
 def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
@@ -385,16 +280,8 @@ def process_file(
             content = msg.get("content") or ""
             if not is_romanized_nepali_message(content, lang_filter):
                 discarded += 1
-                # Log with the specific reason so you can diagnose filter gaps
                 lw = _latin_words(content)
-                if not lw:
-                    reason = "no-latin"
-                elif not lang_filter.is_nepali(content):
-                    reason = "lingua-EN/ES"
-                elif not (lw & _ROMANIZED_NEPALI_SIGNALS):
-                    reason = "no-signal"
-                else:
-                    reason = "unknown"
+                reason = "no-latin" if not lw else "lingua-EN/ES"
                 discard_log.debug("[%s] %s | %s", reason, msg.get("id"), content[:120])
                 continue
 
