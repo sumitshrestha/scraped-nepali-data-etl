@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Generate JSON Schema from large JSON files of any structure:
-- Array of objects
-- Single huge object
-- Line-delimited JSON
+Generate JSON Schema from large JSON files:
+- Array of objects (streaming)
+- Single huge object (streaming, no memory blow‑up)
+- Line‑delimited JSON (one object per line)
 """
 
 import ijson
 import json
 import sys
 from collections import defaultdict
-from typing import Dict, Optional, Any
+from typing import Any, Dict, Optional, List, Tuple
 
 # ----------------------------------------------------------------------
-# Type inference and merging
+# Type inference and merging (shared)
 # ----------------------------------------------------------------------
 
 
@@ -56,8 +56,7 @@ def _merge_array_schema(
                     "properties": new_item_schema.get("properties", {}),
                 },
             }
-        else:
-            return {"type": "array", "items": {"type": new_item_type}}
+        return {"type": "array", "items": {"type": new_item_type}}
     existing_item = existing.get("items", {})
     existing_type = existing_item.get("type")
     if existing_type == "object" and new_item_type == "object" and new_item_schema:
@@ -167,163 +166,175 @@ def _add_required_fields(
 
 
 # ----------------------------------------------------------------------
-# Streaming for a single huge object using ijson.parse
+# Streaming for a single huge object (corrected using stack)
 # ----------------------------------------------------------------------
 
 
 def _stream_schema_from_single_object(file_path: str, max_samples: int = 10000) -> Dict:
     """
-    Traverse a huge JSON object using ijson.parse, sampling at most `max_samples`
-    primitive values to build the schema incrementally.
+    Traverse a huge JSON object using ijson.parse, building the schema
+    incrementally with a stack of current schema nodes.
     """
-    schema = {"type": "object", "properties": {}}
-    # We need a map from path to current type and a count of occurrences
-    # Instead of full counts, we just need to know if a field appears in all
-    # sampled objects – but here we have only *one* logical object,
-    # so "required" will include all fields that appear up to the sample limit.
-    # For simplicity, we treat each unique path as required if it appears.
-    field_occurrences = defaultdict(int)
+    # Stack of (schema_dict, is_array_element) where schema_dict is the current
+    # properties dict (for an object) or the array's item schema (for an array).
+    # We'll maintain a separate stack for the current path for merging.
+    # Simpler: use a single stack where each entry is a dict representing the
+    # current node's "properties" or the array's "items". We'll also keep track
+    # of the type of node (object, array) to know how to attach new fields.
+    stack = []  # each element: (current_dict, node_type, key_being_built)
+    # node_type: 'object' for properties dict, 'array' for items dict
+    # For objects, current_dict is the properties dict.
+    # For arrays, current_dict is the items schema (e.g., {"type": "..."}).
+
+    # We also need to record field occurrence counts to determine required fields.
+    # Since this is a single object, any field that appears is required.
+    # So we can simply mark all fields as required at the end.
+
+    # We'll keep a separate structure to count occurrences per full path
+    # (same as before) but for merging we rely on the schema building.
+    # Let's implement correct incremental merging.
+
+    # Initialize root schema
+    root_schema = {"type": "object", "properties": {}}
+    # Stack entry: (properties_dict, 'object', None)
+    stack.append((root_schema["properties"], "object", None))
 
     with open(file_path, "rb") as f:
         parser = ijson.parse(f)
-        # Stack to track current path segments (list of keys/indexes)
-        path_stack = []
-        # For arrays, we need to know the current array element index (not used for schema)
-        # We'll build a dictionary representation of the schema incrementally.
-        # We'll maintain a reference to the current schema node as we go deep.
-        # This is complex; instead we'll collect field paths and types,
-        # then construct the schema after sampling.
-        # Simpler: record every field path we encounter and its type,
-        # then rebuild the nested object structure later.
         sample_count = 0
-        field_types = {}  # path -> merged type
         for prefix, event, value in parser:
             if sample_count >= max_samples:
                 break
-            if event == "map_key":
-                path_stack.append(value)  # push key
-            elif event == "start_map":
-                pass  # nothing extra
-            elif event == "end_map":
-                if path_stack:
-                    path_stack.pop()
-            elif event == "start_array":
-                path_stack.append("[]")  # mark array position
-            elif event == "end_array":
-                if path_stack and path_stack[-1] == "[]":
-                    path_stack.pop()
-            elif event in ("number", "string", "boolean", "null"):
-                # primitive value
-                full_path = ".".join(str(p) for p in path_stack if p != "[]")
-                if full_path:
-                    # For simplicity, we ignore array element indexing
-                    # and treat the whole array as a generic array.
-                    # We'll handle arrays separately: record that this path is an array,
-                    # and the primitive type is the element type.
-                    # But events for array elements: the path includes '[]' as a placeholder.
-                    # We can detect if the last segment is '[]' -> this is an array element.
-                    if path_stack and path_stack[-1] == "[]":
-                        # This is an array element. We need to store the array path
-                        # and the element type.
-                        array_path = ".".join(
-                            str(p) for p in path_stack[:-1] if p != "[]"
-                        )
-                        elem_type = _primitive_type(value)
-                        # For arrays, we treat the schema as array with items type
-                        # We'll store a special marker
-                        field_types[f"{array_path}[]"] = elem_type
-                    else:
-                        # Regular object field
-                        prim_type = _primitive_type(value)
-                        if full_path in field_types:
-                            field_types[full_path] = _merge_types(
-                                field_types[full_path], prim_type
-                            )
-                        else:
-                            field_types[full_path] = prim_type
-                sample_count += 1
-            elif event == "start_array":
-                # Already handled above for path
-                continue
 
-    # Convert collected flat field types into nested JSON Schema
-    schema_props = {}
-    for path, typ in field_types.items():
-        if path.endswith("[]"):
-            # Array field
-            array_path = path[:-2]
-            parts = array_path.split(".") if array_path else []
-            current = schema_props
-            for i, part in enumerate(parts):
-                if part not in current:
-                    if i == len(parts) - 1:
-                        # This is where the array lives
-                        current[part] = {"type": "array", "items": {"type": typ}}
-                    else:
-                        current[part] = {"type": "object", "properties": {}}
-                current = (
-                    current[part].get("properties", current[part])
-                    if i < len(parts) - 1
-                    else current[part]
-                )
-            # For the array, ensure items type
-            if parts:
-                last = parts[-1]
-                current[last]["items"]["type"] = typ
-        else:
-            # Regular field
-            parts = path.split(".")
-            current = schema_props
-            for i, part in enumerate(parts):
-                if part not in current:
-                    if i == len(parts) - 1:
-                        current[part] = {"type": typ}
-                    else:
-                        current[part] = {"type": "object", "properties": {}}
-                if isinstance(current[part], dict) and i < len(parts) - 1:
-                    current = current[part].setdefault("properties", {})
-                elif i < len(parts) - 1:
-                    # Should be object with properties
-                    if "properties" not in current[part]:
-                        current[part]["properties"] = {}
-                    current = current[part]["properties"]
+            if event == "map_key":
+                # We are inside an object (the top of stack should be an object)
+                # The current key is 'value'
+                key = value
+                # Push a new object entry for this key? No, we will handle when
+                # we see start_map or start_array. For now, just store the key
+                # temporarily. We'll store it as the "key_being_built" in the stack.
+                if stack and stack[-1][1] == "object":
+                    # Replace the last entry with the same but with key_being_built set
+                    cur_dict, cur_type, _ = stack.pop()
+                    stack.append((cur_dict, cur_type, key))
                 else:
-                    # leaf
+                    # Should not happen
                     pass
 
-    # Mark all fields as required (since a single object, any field that appears is required)
-    def mark_required(node):
+            elif event == "start_map":
+                # A new nested object
+                if stack and stack[-1][1] == "object":
+                    cur_dict, cur_type, current_key = stack[-1]
+                    if current_key is not None:
+                        # This map is the value for current_key
+                        # Create a new properties dict for this nested object
+                        if current_key not in cur_dict:
+                            cur_dict[current_key] = {"type": "object", "properties": {}}
+                        elif cur_dict[current_key].get("type") != "object":
+                            # Previous type was a primitive, upgrade to object? This is unlikely.
+                            cur_dict[current_key] = {"type": "object", "properties": {}}
+                        # Push the new properties dict onto the stack
+                        stack.append(
+                            (cur_dict[current_key]["properties"], "object", None)
+                        )
+                    else:
+                        # Should not happen: map_key should have set a key
+                        pass
+                elif stack and stack[-1][1] == "array":
+                    # We are inside an array and encountering an object as an element
+                    # The stack's top is the array's items schema (should be an object)
+                    cur_dict, cur_type, _ = stack[-1]
+                    if cur_dict.get("type") != "object":
+                        # Need to set items to object with properties
+                        cur_dict["type"] = "object"
+                        cur_dict["properties"] = {}
+                    # Push the array's items properties onto stack
+                    stack.append((cur_dict["properties"], "object", None))
+                else:
+                    # Should not happen
+                    pass
+
+            elif event == "end_map":
+                # Pop the stack
+                if stack:
+                    stack.pop()
+
+            elif event == "start_array":
+                # A new array
+                if stack and stack[-1][1] == "object":
+                    cur_dict, cur_type, current_key = stack[-1]
+                    if current_key is not None:
+                        # This array is the value for current_key
+                        if current_key not in cur_dict:
+                            cur_dict[current_key] = {"type": "array", "items": {}}
+                        elif cur_dict[current_key].get("type") != "array":
+                            # Upgrade to array? Not likely.
+                            cur_dict[current_key] = {"type": "array", "items": {}}
+                        # Push the array's items schema onto stack (initially empty)
+                        stack.append((cur_dict[current_key]["items"], "array", None))
+                    else:
+                        pass
+                else:
+                    # Should not happen
+                    pass
+
+            elif event == "end_array":
+                # Pop the stack
+                if stack:
+                    stack.pop()
+
+            elif event in ("number", "string", "boolean", "null"):
+                # Primitive value
+                prim_type = _primitive_type(value) if event != "null" else "null"
+                if stack and stack[-1][1] == "object":
+                    cur_dict, cur_type, current_key = stack[-1]
+                    if current_key is not None:
+                        # This primitive is the value for current_key
+                        if current_key not in cur_dict:
+                            cur_dict[current_key] = {"type": prim_type}
+                        else:
+                            existing_type = cur_dict[current_key].get("type")
+                            cur_dict[current_key] = {
+                                "type": _merge_types(existing_type, prim_type)
+                            }
+                        # Clear the key_being_built in the stack
+                        stack.pop()
+                        stack.append((cur_dict, cur_type, None))
+                    else:
+                        # Primitive value as an array element? Not tracked separately; we treat array items later.
+                        # For arrays, we merge item types only when we see the first element? We'll implement in start_array.
+                        pass
+                elif stack and stack[-1][1] == "array":
+                    # This primitive is an element of the array
+                    cur_dict, cur_type, _ = stack[-1]  # cur_dict is the items schema
+                    existing_type = cur_dict.get("type")
+                    merged = _merge_types(existing_type, prim_type)
+                    cur_dict["type"] = merged
+                sample_count += 1
+
+    # After traversal, mark all fields as required (since it's a single object)
+    def mark_all_required(node):
         if node.get("type") == "object" and "properties" in node:
             node["required"] = list(node["properties"].keys())
             for subnode in node["properties"].values():
-                mark_required(subnode)
+                mark_all_required(subnode)
         elif (
             node.get("type") == "array"
             and "items" in node
             and node["items"].get("type") == "object"
         ):
-            mark_required(node["items"])
+            mark_all_required(node["items"])
 
-    mark_required({"type": "object", "properties": schema_props})
+    # Apply to root properties
+    mark_all_required({"type": "object", "properties": root_schema["properties"]})
 
     return {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "title": "Schema inferred from single huge object (streaming)",
+        "title": f"Schema inferred from single huge object (sampled {sample_count} primitive values)",
         "type": "object",
-        "properties": schema_props,
-        "required": list(schema_props.keys()),
+        "properties": root_schema["properties"],
+        "required": list(root_schema["properties"].keys()),
     }
-
-
-def _schema_from_single_object_streaming(
-    file_path: str, sample_size: int = 100
-) -> Dict:
-    """
-    Public entry point for a single huge JSON object.
-    Uses streaming ijson.parse with limited sample size.
-    """
-    # sample_size here means number of primitive values to sample
-    return _stream_schema_from_single_object(file_path, max_samples=sample_size)
 
 
 # ----------------------------------------------------------------------
@@ -344,18 +355,15 @@ def _peek_first_char(file_path: str) -> str:
 def generate_schema(file_path: str, sample_size: int = 100) -> Dict:
     first_char = _peek_first_char(file_path)
     if first_char == "[":
-        # Top-level array
         return _schema_from_array(file_path, sample_size)
     elif first_char == "{":
-        # Single huge object – use streaming parser
-        return _schema_from_single_object_streaming(file_path, sample_size)
+        return _stream_schema_from_single_object(file_path, max_samples=sample_size)
     else:
-        # Try line-delimited JSON
         return _schema_from_line_delimited(file_path, sample_size)
 
 
 # ----------------------------------------------------------------------
-# Implementations for array and line-delimited (same as before, with minor fixes)
+# Implementations for array and line-delimited
 # ----------------------------------------------------------------------
 
 
@@ -424,7 +432,8 @@ def main():
         "--sample-size",
         type=int,
         default=100,
-        help="Number of objects/primitive values to sample (default: 100)",
+        help="Number of primitive values to sample for a single object, "
+        "or number of objects for array/line-delimited (default: 100)",
     )
     parser.add_argument("-o", "--output", help="Output file (default: stdout)")
     args = parser.parse_args()
