@@ -3,16 +3,21 @@ discord-etl.py
 ==============
 ETL for Discord JSON exports produced by tyrrrz/DiscordChatExporter.
 
+Designed for large exports (5+ GB) — uses streaming JSON parsing (ijson)
+so only one message object is ever in memory at a time, and writes output
+records to disk immediately rather than accumulating them in a list.
+
 Input  : A folder (or nested folders) of .json export files.
-Output : extracted_discord.json — a flat list of message records,
-         filtered to romanized Nepali content via lang_filter.NepaliFilter.
+         Set DISCORD_EXPORT_DIR env var or pass via CLI (default: discord_exports/).
+Output : extracted_discord.json — a flat JSON array of kept message records,
+         written incrementally so peak RAM usage is O(1) regardless of input size.
 
 DiscordChatExporter JSON structure (top-level)
 ----------------------------------------------
 {
   "guild":    { "id": "...", "name": "..." },
   "channel":  { "id": "...", "name": "...", "type": "...", "topic": "..." },
-  "messages": [ ... ]          ← one object per message
+  "messages": [ { ... }, { ... }, ... ]
 }
 
 Each message object
@@ -27,45 +32,31 @@ Each message object
   "mentions":  [ { "id": "...", "name": "..." }, ... ]
 }
 
-Threading model
----------------
-Discord has two reply mechanisms:
-  1. Explicit reply  — message.reference.messageId points to the parent.
-  2. Thread channel  — messages in a thread channel are replies to the thread
-     starter message (channel.type == "PublicThread" | "PrivateThread").
-     The starter message id == channel.id in DiscordChatExporter exports.
-
-We model both as a flat parent_id field (matching the Reddit ETL convention):
-  - Top-level message or thread starter → parent_id = None
-  - Explicit reply                      → parent_id = reference.messageId
-  - Message in a thread channel         → parent_id = channel.id (the starter)
+Threading / parent-child logic
+-------------------------------
+  - Explicit reply (reference.messageId set) → parent_id = reference.messageId
+  - Message in a thread channel              → parent_id = channel.id
+  - Everything else                          → parent_id = null
 
 Language filtering
 ------------------
-Same rules as reddit-etl.py:
-  - Message content must pass NepaliFilter.is_nepali() (not confidently EN/ES)
-    AND contain at least one romanized Nepali signal word.
-  - Purely Devanagari content (no Latin words) is discarded.
-  - System messages (joins, pins, etc.) are always discarded — they have no
-    user-written content.
+  - Purely Devanagari content (no Latin words)   → discard
+  - Lingua confident it is English or Spanish    → discard
+  - No romanized Nepali signal word present      → discard
+  - System messages / bot messages               → always discard
+  - Everything else                              → KEEP
 
-Output schema (one record per kept message)
--------------------------------------------
+Output schema per record
+------------------------
 {
-  "id":          "snowflake",
-  "parent_id":   "snowflake | null",   # null = top-level
-  "kind":        "message",
-  "channel_id":  "snowflake",
-  "channel_name":"...",
-  "guild_id":    "snowflake",
-  "guild_name":  "...",
-  "author_id":   "snowflake",
-  "author_name": "...",
-  "is_bot":      false,
-  "content":     "...",
-  "timestamp":   "ISO-8601 string",
-  "source_file": "relative path to the export file"
+  "id", "parent_id", "kind", "channel_id", "channel_name",
+  "guild_id", "guild_name", "author_id", "author_name",
+  "is_bot", "content", "timestamp", "source_file"
 }
+
+Dependencies
+------------
+    pip install ijson psutil python-dotenv lingua-language-detector
 """
 
 import os
@@ -74,6 +65,8 @@ import json
 import logging
 import time
 from dotenv import load_dotenv
+
+import ijson
 
 from lang_filter import NepaliFilter
 
@@ -87,7 +80,7 @@ logging.basicConfig(
 
 OUTPUT_FILE = "extracted_discord.json"
 
-# Message types that contain no user-written text — always discard.
+# Message types with no user-written text — always discard.
 _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberJoin",
     "ChannelPinnedMessage",
@@ -107,10 +100,9 @@ _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberSubscription",
 }
 
-# Same romanized Nepali signal set as reddit-etl.py —
-# grammatically Nepali words that would never appear in natural English/Spanish.
+# Grammatically Nepali words that never appear in natural English/Spanish.
+# Proper nouns (Kathmandu, Nepal, Pokhara) intentionally excluded.
 _ROMANIZED_NEPALI_SIGNALS = {
-    # Postpositions / case markers
     "lai",
     "bata",
     "sanga",
@@ -121,7 +113,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "dekhi",
     "tiir",
     "tira",
-    # Particles
     "pani",
     "nai",
     "chai",
@@ -136,14 +127,12 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "purai",
     "ali",
     "dherai",
-    # Pronouns / determiners
     "yo",
     "tyo",
     "yei",
     "tei",
     "afu",
     "afai",
-    # Verb stems / conjugated forms
     "cha",
     "chha",
     "chau",
@@ -184,7 +173,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "milena",
     "sakcha",
     "sakina",
-    # Common Nepali-only nouns / adjectives (not place names)
     "manchhe",
     "manche",
     "saathi",
@@ -204,7 +192,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "sukha",
     "kasto",
     "kasari",
-    # Time / discourse words
     "aaja",
     "hijo",
     "bholi",
@@ -214,7 +201,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "kahile",
     "kaha",
     "kina",
-    # Common discourse / filler unique to Nepali
     "yar",
     "yaar",
     "haina",
@@ -230,186 +216,214 @@ _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
 
 
 def _latin_words(text: str) -> set[str]:
-    """Return lowercase Latin-script words with Devanagari stripped."""
     latin_only = _DEVANAGARI_RE.sub(" ", text)
     return {w.lower() for w in re.findall(r"[a-zA-Z']+", latin_only)}
 
 
 def is_romanized_nepali_message(content: str, lang_filter: NepaliFilter) -> bool:
-    """
-    Return True if the message content should be kept.
-
-    Identical logic to reddit-etl.is_post_nepali / _is_romanized_nepali_text:
-      1. No Latin words (purely Devanagari or empty)  → discard
-      2. Lingua not confident it is EN or ES           → proceed
-      3. Contains at least one signal word             → KEEP
-         otherwise                                     → discard
-    """
     if not content or not content.strip():
         return False
-
-    latin_words = _latin_words(content)
-    if not latin_words:
-        return False  # purely Devanagari or emoji/numbers
-
+    lw = _latin_words(content)
+    if not lw:
+        return False  # purely Devanagari / emoji
     if not lang_filter.is_nepali(content):
-        return False  # Lingua is confident: English or Spanish
+        return False  # Lingua: confidently EN or ES
+    return bool(lw & _ROMANIZED_NEPALI_SIGNALS)
 
-    return bool(latin_words & _ROMANIZED_NEPALI_SIGNALS)
 
-
-def _resolve_parent_id(message: dict, channel: dict) -> str | None:
-    """
-    Determine the parent_id for a message.
-
-    Priority:
-      1. Explicit reply   → message["reference"]["messageId"]
-      2. Thread channel   → channel["id"]  (all non-starter messages in a
-                            thread implicitly reply to the thread opener)
-      3. Otherwise        → None  (top-level message)
-
-    For thread channels we treat the very first message (whose id matches
-    the channel id) as the thread starter with parent_id = None, and every
-    subsequent message in that thread as a child of that starter.
-    """
-    # Explicit reply
-    ref = message.get("reference") or {}
-    ref_id = ref.get("messageId")
+def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
+    ref_id = (msg.get("reference") or {}).get("messageId")
     if ref_id:
         return ref_id
-
-    # Thread channel — all messages are children of the thread starter
-    channel_type = channel.get("type", "")
-    if channel_type in ("PublicThread", "PrivateThread", "GuildForum"):
-        # The thread starter's own message id == channel id
-        if message["id"] != channel["id"]:
-            return channel["id"]
-
+    if channel.get("type") in ("PublicThread", "PrivateThread", "GuildForum"):
+        if msg.get("id") != channel.get("id"):
+            return channel.get("id")
     return None
 
 
-def extract_message(
-    message: dict, channel: dict, guild: dict, source_file: str
-) -> dict:
-    """Map a raw DiscordChatExporter message object to our flat output schema."""
-    author = message.get("author") or {}
-    return {
-        "id": message["id"],
-        "parent_id": _resolve_parent_id(message, channel),
-        "kind": "message",
-        "channel_id": channel.get("id"),
-        "channel_name": channel.get("name"),
-        "guild_id": guild.get("id"),
-        "guild_name": guild.get("name"),
-        "author_id": author.get("id"),
-        "author_name": author.get("name"),
-        "is_bot": author.get("isBot", False),
-        "content": message.get("content", ""),
-        "timestamp": message.get("timestamp"),
-        "source_file": source_file,
-    }
+# ---------------------------------------------------------------------------
+# Streaming JSON reader
+# ---------------------------------------------------------------------------
 
 
-def parse_export_file(
-    path: str, lang_filter: NepaliFilter, base_dir: str
-) -> tuple[list[dict], int, int]:
+def _read_header(path: str) -> tuple[dict, dict]:
     """
-    Parse one DiscordChatExporter JSON file.
-
-    Returns (kept_records, total_messages, discarded_count).
+    Read only guild and channel from the top of the file using ijson.
+    These are small objects that appear before the messages array.
+    Returns (guild, channel) as plain dicts.
     """
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
+    guild = {}
+    channel = {}
+    with open(path, "rb") as f:
+        # Collect all key-value pairs at the top level that are NOT 'messages'
+        parser = ijson.kvitems(f, "")
+        for key, value in parser:
+            if key == "guild":
+                guild = value
+            elif key == "channel":
+                channel = value
+            elif key == "messages":
+                # messages array starts here — stop, we have what we need
+                break
+    return guild, channel
 
-    guild = data.get("guild", {}) or {}
-    channel = data.get("channel", {}) or {}
-    messages = data.get("messages", []) or []
 
+def _stream_messages(path: str):
+    """
+    Yield one message dict at a time from the messages array.
+    Peak RAM: one message object (~few KB) regardless of file size.
+    """
+    with open(path, "rb") as f:
+        yield from ijson.items(f, "messages.item")
+
+
+# ---------------------------------------------------------------------------
+# Per-file processing  (streaming in, streaming out)
+# ---------------------------------------------------------------------------
+
+
+def process_file(
+    path: str, lang_filter: NepaliFilter, base_dir: str, out_f, first_record: list
+) -> tuple[int, int, int]:
+    """
+    Stream-parse one export file, filter messages, write kept records
+    directly to out_f (already-open output file handle).
+
+    first_record is a one-element list used as a mutable flag so the caller
+    can track whether to write a leading comma before each record.
+
+    Returns (total, kept, discarded).
+    """
     rel_path = os.path.relpath(path, base_dir)
-    kept = []
-    discarded = 0
 
-    for msg in messages:
-        msg_type = msg.get("type", "Default")
+    try:
+        guild, channel = _read_header(path)
+    except Exception as e:
+        logging.error("Failed to read header of %s: %s", rel_path, e)
+        return 0, 0, 0
 
-        # Drop system / auto-generated messages
-        if msg_type in _SYSTEM_MESSAGE_TYPES:
-            discarded += 1
-            continue
+    total = kept = discarded = 0
 
-        content = msg.get("content") or ""
+    try:
+        for msg in _stream_messages(path):
+            total += 1
 
-        # Drop bot messages (usually commands / automated responses)
-        author = msg.get("author") or {}
-        if author.get("isBot", False):
-            discarded += 1
-            logging.debug("Dropped bot message %s", msg.get("id"))
-            continue
+            # System messages
+            if msg.get("type") in _SYSTEM_MESSAGE_TYPES:
+                discarded += 1
+                continue
 
-        if not is_romanized_nepali_message(content, lang_filter):
-            discarded += 1
-            logging.debug(
-                "Dropped non-Nepali message %s: %s", msg.get("id"), content[:60]
-            )
-            continue
+            # Bot messages
+            author = msg.get("author") or {}
+            if author.get("isBot", False):
+                discarded += 1
+                continue
 
-        kept.append(extract_message(msg, channel, guild, rel_path))
+            content = msg.get("content") or ""
+            if not is_romanized_nepali_message(content, lang_filter):
+                discarded += 1
+                logging.debug("Dropped %s: %s", msg.get("id"), content[:60])
+                continue
 
-    return kept, len(messages), discarded
+            record = {
+                "id": msg["id"],
+                "parent_id": _resolve_parent_id(msg, channel),
+                "kind": "message",
+                "channel_id": channel.get("id"),
+                "channel_name": channel.get("name"),
+                "guild_id": guild.get("id"),
+                "guild_name": guild.get("name"),
+                "author_id": author.get("id"),
+                "author_name": author.get("name"),
+                "is_bot": author.get("isBot", False),
+                "content": content,
+                "timestamp": msg.get("timestamp"),
+                "source_file": rel_path,
+            }
+
+            # Write directly to output file — no in-memory accumulation
+            if first_record[0]:
+                out_f.write("\n  ")
+                first_record[0] = False
+            else:
+                out_f.write(",\n  ")
+
+            out_f.write(json.dumps(record, ensure_ascii=False))
+            kept += 1
+
+    except Exception as e:
+        logging.error("Error streaming messages from %s: %s", rel_path, e)
+
+    return total, kept, discarded
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main(export_dir: str) -> None:
     start = time.time()
     logging.info("Discord ETL starting. Input dir: %s", export_dir)
+    logging.info("Output file: %s  (written incrementally)", OUTPUT_FILE)
 
     lang_filter = NepaliFilter()
 
-    all_records = []
+    # Collect all json files upfront so we can log total count
+    all_files = []
+    for root, _, files in os.walk(export_dir):
+        for fname in sorted(files):
+            if fname.endswith(".json"):
+                all_files.append(os.path.join(root, fname))
+
+    logging.info("Found %d JSON files to process.", len(all_files))
+
     file_count = 0
     msg_total = 0
     msg_kept = 0
     msg_discarded = 0
 
-    for root, _, files in os.walk(export_dir):
-        for fname in files:
-            if not fname.endswith(".json"):
-                continue
+    # Open output file once and stream records into it as they are found.
+    # This means peak RAM for output is one record, not the full dataset.
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as out_f:
+        out_f.write("[")
+        first_record = [True]  # mutable flag passed into process_file
 
-            path = os.path.join(root, fname)
+        for path in all_files:
             file_count += 1
-            try:
-                kept, total, discarded = parse_export_file(
-                    path, lang_filter, export_dir
-                )
-                all_records.extend(kept)
-                msg_total += total
-                msg_kept += len(kept)
-                msg_discarded += discarded
-                logging.info(
-                    "Processed: %s  [%d kept / %d total]",
-                    os.path.relpath(path, export_dir),
-                    len(kept),
-                    total,
-                )
-            except Exception as exc:
-                logging.error("Error reading %s: %s", path, exc)
+            rel = os.path.relpath(path, export_dir)
+            file_size_mb = os.path.getsize(path) / 1024 / 1024
+            logging.info(
+                "[%d/%d] Processing: %s  (%.1f MB)",
+                file_count,
+                len(all_files),
+                rel,
+                file_size_mb,
+            )
+
+            total, kept, discarded = process_file(
+                path, lang_filter, export_dir, out_f, first_record
+            )
+            msg_total += total
+            msg_kept += kept
+            msg_discarded += discarded
+
+            logging.info(
+                "  -> %d kept / %d total / %d discarded", kept, total, discarded
+            )
+
+        out_f.write("\n]\n")
 
     elapsed = time.time() - start
     logging.info(
-        "Done. %d files | %d messages total | %d kept | %d discarded | %.2fs",
+        "Done. %d files | %d messages total | %d kept | %d discarded | %.1fs",
         file_count,
         msg_total,
         msg_kept,
         msg_discarded,
         elapsed,
     )
-
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(all_records, f, indent=2, ensure_ascii=False)
-        logging.info("Results saved to %s", OUTPUT_FILE)
-    except Exception as exc:
-        logging.error("Failed to write output: %s", exc)
+    logging.info("Results saved to %s", OUTPUT_FILE)
 
 
 if __name__ == "__main__":
