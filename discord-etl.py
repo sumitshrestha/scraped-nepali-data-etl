@@ -72,13 +72,39 @@ from lang_filter import NepaliFilter
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-
 OUTPUT_FILE = "extracted_discord.json"
+DISCARD_LOG = "discarded_messages.log"  # one line per discarded message
+
+
+def _setup_logging():
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    # Console — INFO and above (progress, summary)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(ch)
+
+    # Discard log — separate file, written by a dedicated logger
+    # Uses a RotatingFileHandler so it never grows unbounded
+    from logging.handlers import RotatingFileHandler
+
+    discard_handler = RotatingFileHandler(
+        DISCARD_LOG, maxBytes=50 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    discard_handler.setLevel(logging.DEBUG)
+    discard_handler.setFormatter(logging.Formatter("%(message)s"))  # plain lines
+    discard_handler.addFilter(lambda r: r.name == "discard")
+
+    logging.getLogger("discard").addHandler(discard_handler)
+    logging.getLogger("discard").propagate = False  # don't echo to console
+
+
+_setup_logging()
+discard_log = logging.getLogger("discard")
 
 # Message types with no user-written text — always discard.
 _SYSTEM_MESSAGE_TYPES = {
@@ -344,18 +370,32 @@ def process_file(
             # System messages
             if msg.get("type") in _SYSTEM_MESSAGE_TYPES:
                 discarded += 1
+                discard_log.debug("[system:%s] %s", msg.get("type"), msg.get("id"))
                 continue
 
             # Bot messages
             author = msg.get("author") or {}
             if author.get("isBot", False):
                 discarded += 1
+                discard_log.debug(
+                    "[bot] %s | %s", msg.get("id"), (msg.get("content") or "")[:120]
+                )
                 continue
 
             content = msg.get("content") or ""
             if not is_romanized_nepali_message(content, lang_filter):
                 discarded += 1
-                logging.debug("Dropped %s: %s", msg.get("id"), content[:60])
+                # Log with the specific reason so you can diagnose filter gaps
+                lw = _latin_words(content)
+                if not lw:
+                    reason = "no-latin"
+                elif not lang_filter.is_nepali(content):
+                    reason = "lingua-EN/ES"
+                elif not (lw & _ROMANIZED_NEPALI_SIGNALS):
+                    reason = "no-signal"
+                else:
+                    reason = "unknown"
+                discard_log.debug("[%s] %s | %s", reason, msg.get("id"), content[:120])
                 continue
 
             record = {
