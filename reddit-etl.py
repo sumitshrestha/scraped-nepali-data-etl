@@ -8,24 +8,38 @@ from lang_filter import NepaliFilter
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SCRAPED_DIR = os.getenv("SCRAPED_DIR", "scrapi_reddit_data")
+OUTPUT_FILE = os.getenv("REDDIT_OUTPUT_FILE", "extracted_posts.json")
+LINGUA_NEPALI_THRESHOLD = float(os.getenv("LINGUA_NEPALI_THRESHOLD", "0.85"))
+LINGUA_ENGLISH_THRESHOLD = float(os.getenv("LINGUA_ENGLISH_THRESHOLD", "0.50"))
+LINGUA_SPANISH_THRESHOLD = float(os.getenv("LINGUA_SPANISH_THRESHOLD", "0.50"))
+LINGUA_MIN_RELATIVE_DISTANCE = float(os.getenv("LINGUA_MIN_RELATIVE_DISTANCE", "0.10"))
+LINGUA_LOW_MEMORY = os.getenv("LINGUA_LOW_MEMORY", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("etl.log", encoding="utf-8")
-    ]
+        logging.FileHandler("etl.log", encoding="utf-8"),
+    ],
 )
 
-# Romanized Nepali signal words used as a positive gate for post filtering.
+# ---------------------------------------------------------------------------
+# Romanized Nepali signal words — positive gate for post filtering.
 # A post with no Devanagari must contain at least one of these to be kept.
-# These are common enough that genuine Nepali posts almost always hit one,
-# but rare enough in plain English that false positives are minimal.
-# Words that are grammatically Nepali — particles, verb forms, pronouns,
-# postpositions — things that would never appear in a natural English or
-# Spanish sentence.  Proper nouns (Kathmandu, Nepali, Pokhara) are
+# Words are grammatically Nepali (particles, verb forms, pronouns,
+# postpositions) — things that would never appear in a natural English or
+# Spanish sentence. Proper nouns (Kathmandu, Nepali, Pokhara) are
 # intentionally excluded: they appear in English sentences about Nepal
 # constantly and give no signal that the *language* of the text is Nepali.
+# ---------------------------------------------------------------------------
 _ROMANIZED_NEPALI_SIGNALS = {
     # Postpositions / case markers
     "lai",
@@ -71,7 +85,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "thiyo",
     "thyo",
     "thiye",
-    "thiyo",
     "hola",
     "huncha",
     "hudaina",
@@ -142,7 +155,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "yaar",
     "haina",
     "hoina",
-    "haina",
     "tara",
     "ani",
     "ra",
@@ -151,6 +163,9 @@ _ROMANIZED_NEPALI_SIGNALS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
 def extract_post_info(post):
     return {
         "id": post.get("id"),
@@ -205,10 +220,18 @@ def parse_post_json(post_json):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Language filtering
+# ---------------------------------------------------------------------------
 def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter) -> bool:
     """
     Return True if a single piece of text qualifies as romanized Nepali.
-    Used independently on title and content so each field is judged on its own.
+
+    Uses lang_filter.is_nepali() (nepali_threshold, conservative 0.85 by
+    default) so that short ambiguous comments are kept rather than lost.
+    An additional signal-word gate ensures at least one unambiguously Nepali
+    word is present — this catches English sentences that slip past Lingua
+    because they are short or contain Nepali proper nouns.
     """
     if not text or not text.strip():
         return False
@@ -257,7 +280,6 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
     title_ok = _is_romanized_nepali_text(title, lang_filter)
     content_ok = _is_romanized_nepali_text(content, lang_filter)
 
-    # Discard if neither field has any romanized Nepali
     if not title_ok and not content_ok:
         return None
 
@@ -267,19 +289,34 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
     return result
 
 
-def main(scraped_dir):
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main(scraped_dir: str) -> None:
     start_time = time.time()
-    logging.info("Starting extraction from directory: %s", scraped_dir)
+    logging.info("Reddit ETL starting. Input dir: %s", scraped_dir)
+    logging.info("Output: %s", OUTPUT_FILE)
+    logging.info(
+        "Config: NEPALI=%.2f  EN=%.2f  ES=%.2f  MRD=%.2f  LOW_MEM=%s",
+        LINGUA_NEPALI_THRESHOLD,
+        LINGUA_ENGLISH_THRESHOLD,
+        LINGUA_SPANISH_THRESHOLD,
+        LINGUA_MIN_RELATIVE_DISTANCE,
+        LINGUA_LOW_MEMORY,
+    )
 
-    # Load filter once — both post and comment filtering reuse this instance
-    lang_filter = NepaliFilter()
+    lang_filter = NepaliFilter(
+        nepali_threshold=LINGUA_NEPALI_THRESHOLD,
+        english_threshold=LINGUA_ENGLISH_THRESHOLD,
+        spanish_threshold=LINGUA_SPANISH_THRESHOLD,
+        min_relative_distance=LINGUA_MIN_RELATIVE_DISTANCE,
+        low_memory=LINGUA_LOW_MEMORY,
+    )
 
     posts_and_comments = []
     file_count = 0
-    post_count = 0
-    post_discarded = 0
-    comment_count = 0
-    comment_discarded = 0
+    post_count = post_discarded = 0
+    comment_count = comment_discarded = 0
 
     for root, dirs, files in os.walk(scraped_dir):
         for file in files:
@@ -317,9 +354,10 @@ def main(scraped_dir):
 
                     for comment in comments:
                         body = comment.get("body") or ""
-                        # Comments use the conservative is_nepali() threshold:
-                        # short romanized Nepali comments look ambiguous to
-                        # Lingua so we keep anything not clearly EN/ES.
+                        # Comments use is_nepali() with the conservative
+                        # nepali_threshold (default 0.85): short romanized
+                        # Nepali comments look ambiguous to Lingua so we keep
+                        # anything that isn't clearly EN/ES.
                         if not lang_filter.is_nepali(body):
                             comment_discarded += 1
                             logging.debug(
@@ -341,23 +379,22 @@ def main(scraped_dir):
     elapsed = time.time() - start_time
     logging.info(
         "Processed %d files | %d posts kept | %d posts discarded "
-        "| %d comments kept | %d comments discarded",
+        "| %d comments kept | %d comments discarded | %.2fs",
         file_count,
         post_count,
         post_discarded,
         comment_count,
         comment_discarded,
+        elapsed,
     )
-    logging.info("Elapsed: %.2f seconds.", elapsed)
 
     try:
-        with open("extracted_posts.json", "w", encoding="utf-8") as out:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
             json.dump(posts_and_comments, out, indent=2, ensure_ascii=False)
-        logging.info("Results saved to extracted_posts.json.")
+        logging.info("Results saved to %s", OUTPUT_FILE)
     except Exception as e:
         logging.error("Failed to write output file: %s", e)
 
 
 if __name__ == "__main__":
-    scraped_dir = os.getenv("SCRAPED_DIR", "scrapi_reddit_data")
-    main(scraped_dir)
+    main(SCRAPED_DIR)

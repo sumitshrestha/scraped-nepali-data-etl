@@ -25,35 +25,53 @@ Design decisions
 * Purely Devanagari text (zero Latin words) is discarded by a fast regex
   check before Lingua is ever called — no model inference needed.
 
-* Two separate thresholds serve different filtering needs:
-    - is_nepali()  uses a HIGH threshold (default 0.85) — conservative,
-      keeps anything Lingua isn't very sure is English/Spanish.  Good for
-      short comments where romanized Nepali looks ambiguous.
-    - is_english() uses a LOW threshold (default 0.50) — aggressive,
-      catches English even when Lingua is only moderately confident.
-      Good for post titles/bodies where false negatives (keeping English)
-      are the main problem.
+* All thresholds are constructor parameters — no magic numbers live in this
+  module.  Each ETL reads its own environment variables and passes them in,
+  keeping this file a pure library with no env/config side effects.
+
+  nepali_threshold  (default 0.85) — used by is_nepali().  Conservative:
+    keeps anything Lingua isn't very sure is English/Spanish.  Good for
+    short comments where romanized Nepali looks ambiguous.
+
+  english_threshold (default 0.50) — used by is_english().  Aggressive:
+    catches English even when Lingua is only moderately confident.  Good
+    for post titles/bodies where false negatives are the main problem.
+
+  spanish_threshold (default 0.50) — used by is_spanish().  Same
+    reasoning as english_threshold.
+
+  min_relative_distance (default 0.10) — passed to Lingua's builder.
+    Controls how decisive Lingua must be between its top two candidates
+    before it will name a language.  Lower = fires more often on short
+    text; higher = more abstentions.
 
 Public API
 ----------
     from lang_filter import NepaliFilter
 
-    f = NepaliFilter()                         # default thresholds
+    f = NepaliFilter(
+        nepali_threshold=0.85,
+        english_threshold=0.50,
+        spanish_threshold=0.50,
+        min_relative_distance=0.10,
+        low_memory=False,
+    )
+
     f.is_nepali("yo geet dherai ramro cha")    # True  — romanized Nepali
     f.is_nepali("this is the best song")       # False — English
     f.is_nepali("राम्रो गीत छ")               # False — pure Devanagari
     f.is_nepali("yo song राम्रो cha bro")     # True  — mixed, kept
 
-    f.is_english("Some rocks I found at Udayapur.")  # True  — English
-    f.is_english("yo dai kasto cha")                 # False — not English
-    f.is_spanish("hola que tal")                     # True  — Spanish
+    f.is_english("Some rocks I found at Udayapur.")  # True
+    f.is_english("yo dai kasto cha")                 # False
+    f.is_spanish("hola que tal")                     # True
 
     # Text cleaning (strip Discord/Reddit noise before detection)
     from lang_filter import clean_text
     clean_text("<@123> bro kasto xa? 🍑")      # "bro kasto xa?"
     clean_text(":JN_sadpuff: haha lol")         # "haha lol"
 
-    # Convenience module-level function
+    # Module-level convenience (uses default thresholds — fine for Reddit ETL)
     from lang_filter import is_nepali
     is_nepali("yo dai ramro cha")              # True
 
@@ -72,8 +90,6 @@ log = logging.getLogger(__name__)
 # Text cleaning
 # ---------------------------------------------------------------------------
 
-# Discord / Reddit markup noise removed before language detection.
-# Order matters: remove structured tokens first, then loose punctuation.
 _CLEAN_PATTERNS = [
     # Discord: animated custom emoji
     (re.compile(r"<a:[^:>]+:\d+>"), ""),
@@ -100,7 +116,7 @@ _CLEAN_PATTERNS = [
     ),
     # Decorative separators
     (re.compile(r"[-=_~*\u23AF\u2014]{3,}"), ""),
-    # Markdown symbols (bold, italic, etc.)
+    # Markdown symbols
     (re.compile(r"\*{1,3}|_{1,2}"), ""),
     # Collapse whitespace
     (re.compile(r"\s+"), " "),
@@ -120,9 +136,6 @@ def clean_text(text: str) -> str:
       - Decorative separators   ⎯⎯⎯  ———
       - Markdown remnants       ** __ * _
       - Extra whitespace
-
-    The cleaned text is used ONLY for language detection — the original
-    unmodified text is always what gets written to the output file.
 
     Examples
     --------
@@ -144,18 +157,16 @@ _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]+")
 
 
 def _devanagari_words(text: str) -> list[str]:
-    """Return all Devanagari tokens found in text."""
     return _DEVANAGARI_RE.findall(text)
 
 
 def _latin_words(text: str) -> list[str]:
-    """Return all Latin-script words from text, ignoring Devanagari characters."""
     latin_only = _DEVANAGARI_RE.sub(" ", text)
     return re.findall(r"[a-zA-Z']+", latin_only)
 
 
 # ---------------------------------------------------------------------------
-# NepaliFilter class
+# NepaliFilter
 # ---------------------------------------------------------------------------
 
 
@@ -163,36 +174,46 @@ class NepaliFilter:
     """
     Stateful filter that wraps a Lingua detector.
 
-    Creating an instance loads Lingua language models into memory.
-    By default all 75 models (~1 GB) are loaded; pass low_memory=True or
-    have <1.2 GB free RAM to load only EN+ES+NE models (~50 MB) instead.
-    Instantiate once and reuse across your entire scrape run — do not create
-    a new instance per comment or post.
+    All thresholds are set at construction time — callers (ETL scripts) read
+    their environment variables and pass values here.  This class has no
+    knowledge of os.environ and no hidden defaults beyond the documented ones.
+
+    Instantiate once per process and reuse — loading Lingua models is expensive.
 
     Parameters
     ----------
-    threshold : float
-        Default confidence level for is_nepali() — above this, a comment is
-        discarded as English or Spanish.  Default 0.85 (strict / conservative).
+    nepali_threshold : float
+        Confidence above which is_nepali() considers text to be English or
+        Spanish and discards it.  High value = conservative (keeps more).
+        Default 0.85.
+    english_threshold : float
+        Confidence above which is_english() fires.  Low value = aggressive
+        (catches more English).  Default 0.50.
+    spanish_threshold : float
+        Confidence above which is_spanish() fires.  Default 0.50.
+    min_relative_distance : float
+        Passed to Lingua's builder.  Minimum score gap between the top two
+        language candidates before Lingua will commit to a language.
+        Lower = fires more often on short/ambiguous text.  Default 0.10.
+    low_memory : bool
+        When True, load only EN+ES+NE models (~50 MB) instead of all 75
+        (~1 GB).  Auto-enabled when free RAM < 1.2 GB (requires psutil).
+        Default False.
     """
 
-    def __init__(self, threshold: float = 0.85, low_memory: bool = False) -> None:
-        """
-        Parameters
-        ----------
-        threshold : float
-            Confidence level above which a comment is discarded as EN or ES.
-        low_memory : bool
-            When True, load only English, Spanish, and Nepali models (~50 MB)
-            instead of all 75 (~1 GB).  Use this on machines with <1.5 GB free
-            RAM (e.g. a local laptop or small VPS).  Detection accuracy is
-            slightly lower for edge cases, but the three-language subset covers
-            exactly the languages you need to filter, so results remain good.
-            Detected automatically when available RAM < 1.2 GB.
-        """
-        self.threshold = threshold
+    def __init__(
+        self,
+        nepali_threshold: float = 0.85,
+        english_threshold: float = 0.50,
+        spanish_threshold: float = 0.50,
+        min_relative_distance: float = 0.10,
+        low_memory: bool = False,
+    ) -> None:
+        self.nepali_threshold = nepali_threshold
+        self.english_threshold = english_threshold
+        self.spanish_threshold = spanish_threshold
 
-        # Auto-detect memory pressure if caller didn't specify
+        # Auto-detect memory pressure
         if not low_memory:
             try:
                 import psutil
@@ -206,50 +227,44 @@ class NepaliFilter:
                         free_gb,
                     )
             except ImportError:
-                pass  # psutil not installed — trust caller's choice
+                pass
 
-        if low_memory:
-            log.info("NepaliFilter: loading Lingua detector (EN, ES, NE only)...")
-            self._detector = (
-                LanguageDetectorBuilder.from_languages(
-                    Language.ENGLISH, Language.SPANISH, Language.NEPALI
-                )
-                .with_minimum_relative_distance(0.1)
-                .build()
+        builder = (
+            LanguageDetectorBuilder.from_languages(
+                Language.ENGLISH, Language.SPANISH, Language.NEPALI
             )
-        else:
-            log.info("NepaliFilter: loading Lingua detector (all 75 languages)...")
-            self._detector = (
-                LanguageDetectorBuilder.from_all_languages()
-                .with_minimum_relative_distance(0.1)
-                .build()
-            )
+            if low_memory
+            else LanguageDetectorBuilder.from_all_languages()
+        )
+        self._detector = builder.with_minimum_relative_distance(
+            min_relative_distance
+        ).build()
 
         mode = "low-memory" if low_memory else "full"
         log.info(
-            "NepaliFilter: detector ready [%s mode, threshold=%.0f%%].",
+            "NepaliFilter ready [%s | nepali=%.0f%% EN=%.0f%% ES=%.0f%% mrd=%.2f]",
             mode,
-            threshold * 100,
+            nepali_threshold * 100,
+            english_threshold * 100,
+            spanish_threshold * 100,
+            min_relative_distance,
         )
 
     # ------------------------------------------------------------------
-    # Low-level helpers (available for callers that need them directly)
+    # Low-level helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def devanagari_words(text: str) -> list[str]:
-        """Return Devanagari tokens found in text."""
         return _devanagari_words(text)
 
     @staticmethod
     def latin_words(text: str) -> list[str]:
-        """Return Latin-script words found in text (Devanagari stripped first)."""
         return _latin_words(text)
 
     def confidence_map(self, latin_text: str) -> dict[Language, float]:
         """
         Return Lingua's full confidence map for the given Latin text.
-        Useful for debugging or building custom rules on top of this module.
 
         Example:
             conf = f.confidence_map("yo dai kasto cha")
@@ -261,7 +276,7 @@ class NepaliFilter:
     def _latin_confidence(
         self, text: str, language: Language, threshold: float
     ) -> bool:
-        """Shared implementation: clean, strip Devanagari, run Lingua, check threshold."""
+        """Strip noise + Devanagari, run Lingua, check threshold."""
         stripped = clean_text(text)
         if not stripped:
             return False
@@ -279,101 +294,69 @@ class NepaliFilter:
         """
         Return True if text should be kept as Nepali content.
 
-        Uses self.threshold (default 0.85) — conservative, because romanized
-        Nepali shares many short words with English and we don't want false
-        discards on ambiguous comments.
+        Uses self.nepali_threshold (default 0.85) — conservative, so that
+        romanized Nepali which looks ambiguous to Lingua is kept rather than
+        lost.
 
         Decision pipeline
         -----------------
-        1. Clean text (strip emoji, mentions, URLs)  → work on clean version
+        1. Clean text (strip emoji, mentions, URLs)
         2. Empty / whitespace only               → DISCARD
         3. Has Devanagari, zero Latin words      → DISCARD  (purely Devanagari)
         4. Zero Latin words (emoji / nums only)  → DISCARD
-        5. Run Lingua on the Latin-only portion:
-               ENGLISH confidence ≥ threshold   → DISCARD
-               SPANISH confidence ≥ threshold   → DISCARD
-               anything else                    → KEEP
-           (Nepali, uncertain, other language → all kept)
+        5. Lingua on Latin-only portion:
+               ENGLISH confidence ≥ nepali_threshold  → DISCARD
+               SPANISH confidence ≥ nepali_threshold  → DISCARD
+               anything else                          → KEEP
         """
-        stripped = clean_text(text)  # strip emoji, mentions, URLs first
-
-        # 1. Empty
+        stripped = clean_text(text)
         if not stripped:
             return False
 
         deva = _devanagari_words(stripped)
         latin = _latin_words(stripped)
 
-        # 2. Purely Devanagari — no Latin words at all
         if deva and not latin:
             return False
-
-        # 3. No Latin letters (emoji / number-only)
         if not latin:
             return False
 
-        # 4. Language detection on Latin portion only
         latin_text = " ".join(latin)
         conf = self.confidence_map(latin_text)
 
-        if conf.get(Language.ENGLISH, 0) >= self.threshold:
+        if conf.get(Language.ENGLISH, 0) >= self.nepali_threshold:
             return False
-        if conf.get(Language.SPANISH, 0) >= self.threshold:
+        if conf.get(Language.SPANISH, 0) >= self.nepali_threshold:
             return False
 
-        # Nepali, uncertain, or any other language → keep
         return True
 
-    def is_english(self, text: str, threshold: float = 0.50) -> bool:
+    def is_english(self, text: str) -> bool:
         """
         Return True if text is confidently English.
 
-        Uses a LOW default threshold (0.50) — aggressive detection, because
-        here the goal is to catch English posts/titles that slipped through
-        is_nepali().  Proper nouns like "Udayapur" or "Pokhara" in otherwise
-        English text won't prevent detection at this threshold.
-
-        Tune threshold upward (e.g. 0.70) if legitimate romanized Nepali
-        text is being mis-flagged as English.
-
-        Parameters
-        ----------
-        threshold : float
-            Override the default 0.50 for this specific call.
+        Uses self.english_threshold (default 0.50) — aggressive, to catch
+        English posts/titles that slipped through is_nepali().
         """
-        return self._latin_confidence(text, Language.ENGLISH, threshold)
+        return self._latin_confidence(text, Language.ENGLISH, self.english_threshold)
 
-    def is_spanish(self, text: str, threshold: float = 0.50) -> bool:
+    def is_spanish(self, text: str) -> bool:
         """
         Return True if text is confidently Spanish.
 
-        Uses a LOW default threshold (0.50) — same reasoning as is_english().
-
-        Parameters
-        ----------
-        threshold : float
-            Override the default 0.50 for this specific call.
+        Uses self.spanish_threshold (default 0.50).
         """
-        return self._latin_confidence(text, Language.SPANISH, threshold)
+        return self._latin_confidence(text, Language.SPANISH, self.spanish_threshold)
 
     def filter(self, texts: list[str]) -> list[str]:
-        """
-        Convenience batch method.
-        Returns only the texts that pass is_nepali().
-        """
+        """Convenience batch method. Returns only texts that pass is_nepali()."""
         return [t for t in texts if self.is_nepali(t)]
 
 
 # ---------------------------------------------------------------------------
-# Module-level convenience instance
+# Module-level convenience (uses default thresholds — suitable for Reddit ETL
+# when called without explicit configuration)
 # ---------------------------------------------------------------------------
-# Importing `is_nepali` directly gives a drop-in function backed by a shared
-# NepaliFilter instance (loaded once on first call, reused forever).
-#
-# Usage:
-#     from lang_filter import is_nepali
-#     if is_nepali(comment_text):
-#         ...
 
 _default_filter: NepaliFilter | None = None
 
@@ -388,7 +371,7 @@ def _get_default_filter() -> NepaliFilter:
 def is_nepali(text: str) -> bool:
     """
     Module-level convenience wrapper around NepaliFilter.is_nepali().
-    Uses a shared NepaliFilter instance loaded once on first call.
+    Uses a shared NepaliFilter instance with default thresholds.
     For custom thresholds, instantiate NepaliFilter directly.
     """
     return _get_default_filter().is_nepali(text)

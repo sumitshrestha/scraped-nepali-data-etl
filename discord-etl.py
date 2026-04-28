@@ -45,19 +45,20 @@ Language filtering  (three-stage pipeline)
     · Bot messages
 
   Stage 2 — fast heuristics (no model inference):
-    · No Latin words after Devanagari is stripped         → discard
-    · Fewer than MIN_LATIN_WORDS Latin words              → discard
+    · No Latin words after Devanagari is stripped           → discard
+    · Fewer than MIN_LATIN_WORDS Latin words                → discard
     · Common-English-word density ≥ ENGLISH_DENSITY_THRESHOLD → discard
-      (catches "How much is the signing bonus?", "Why bro", etc.
-       before Lingua is ever called)
 
-  Stage 3 — Lingua model:
-    · Lingua English confidence ≥ LINGUA_ENGLISH_THRESHOLD → discard
-    · Lingua Spanish confidence ≥ LINGUA_SPANISH_THRESHOLD → discard
-    · Everything else                                      → KEEP
+  Stage 3 — Lingua model (thresholds set on NepaliFilter instance):
+    · English confidence ≥ LINGUA_ENGLISH_THRESHOLD         → discard
+    · Spanish confidence ≥ LINGUA_SPANISH_THRESHOLD         → discard
+    · Everything else                                       → KEEP
 
-  False positives (genuine Nepali kept alongside noise) are acceptable;
-  a manual review flag is written to the discard log for borderline cases.
+  Note: is_nepali() is intentionally not used here. The Discord ETL uses
+  more aggressive EN/ES thresholds (0.5) than the Reddit ETL (0.85) because
+  Discord messages are much shorter and more likely to be pure English noise.
+  Calling is_english() and is_spanish() directly lets each ETL own its
+  thresholds independently via its own env vars.
 
 Output schema per record
 ------------------------
@@ -69,16 +70,16 @@ Output schema per record
 
 Configuration  (all via .env or environment variables)
 ------------------------------------------------------
-  DISCORD_EXPORT_DIR          Input folder   (default: discord_exports)
-  OUTPUT_FILE                 Output path    (default: extracted_discord.json)
-  DISCARD_LOG                 Discard log    (default: discarded_messages.log)
-  LOG_EVERY                   Progress interval, messages (default: 10000)
-  MIN_LATIN_WORDS             Minimum Latin words to pass stage-2 (default: 3)
-  ENGLISH_DENSITY_THRESHOLD   Common-EN density cutoff, 0–1 (default: 0.6)
-  LINGUA_ENGLISH_THRESHOLD    Lingua EN confidence cutoff, 0–1 (default: 0.5)
-  LINGUA_SPANISH_THRESHOLD    Lingua ES confidence cutoff, 0–1 (default: 0.5)
-  LINGUA_MIN_RELATIVE_DISTANCE  Lingua decisiveness, 0–1 (default: 0.1)
-  LINGUA_LOW_MEMORY           Force low-memory Lingua mode (default: false)
+  DISCORD_EXPORT_DIR              Input folder        (default: discord_exports)
+  OUTPUT_FILE                     Output path         (default: extracted_discord.json)
+  DISCARD_LOG                     Discard log path    (default: discarded_messages.log)
+  LOG_EVERY                       Progress interval   (default: 10000)
+  MIN_LATIN_WORDS                 Stage-2 min words   (default: 3)
+  ENGLISH_DENSITY_THRESHOLD       Stage-2 EN density  (default: 0.6)
+  LINGUA_ENGLISH_THRESHOLD        Stage-3 EN cutoff   (default: 0.5)
+  LINGUA_SPANISH_THRESHOLD        Stage-3 ES cutoff   (default: 0.5)
+  LINGUA_MIN_RELATIVE_DISTANCE    Lingua decisiveness (default: 0.1)
+  LINGUA_LOW_MEMORY               Force low-mem mode  (default: false)
 
 Dependencies
 ------------
@@ -99,19 +100,18 @@ from lang_filter import NepaliFilter, clean_text
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration — read from environment, fall back to sensible defaults
+# Configuration
 # ---------------------------------------------------------------------------
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "extracted_discord.json")
 DISCARD_LOG = os.getenv("DISCARD_LOG", "discarded_messages.log")
 LOG_EVERY = int(os.getenv("LOG_EVERY", "10000"))
 
-# Stage-2 heuristic thresholds
 MIN_LATIN_WORDS = int(os.getenv("MIN_LATIN_WORDS", "3"))
 ENGLISH_DENSITY_THRESHOLD = float(os.getenv("ENGLISH_DENSITY_THRESHOLD", "0.6"))
 
-# Stage-3 Lingua thresholds (passed through to NepaliFilter / is_english / is_spanish)
 LINGUA_ENGLISH_THRESHOLD = float(os.getenv("LINGUA_ENGLISH_THRESHOLD", "0.5"))
 LINGUA_SPANISH_THRESHOLD = float(os.getenv("LINGUA_SPANISH_THRESHOLD", "0.5"))
+LINGUA_MIN_RELATIVE_DISTANCE = float(os.getenv("LINGUA_MIN_RELATIVE_DISTANCE", "0.1"))
 LINGUA_LOW_MEMORY = os.getenv("LINGUA_LOW_MEMORY", "false").lower() == "true"
 
 
@@ -129,7 +129,6 @@ def _setup_logging() -> None:
     root.setLevel(logging.DEBUG)
     root.addHandler(ch)
 
-    # Discard log — plain lines, separate logger so it never echoes to console
     discard_handler = logging.FileHandler(DISCARD_LOG, mode="a", encoding="utf-8")
     discard_handler.setLevel(logging.DEBUG)
     discard_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -145,8 +144,6 @@ discard_log = logging.getLogger("discard")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Message types with no user-written text — always discard.
 _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberJoin",
     "ChannelPinnedMessage",
@@ -166,10 +163,9 @@ _SYSTEM_MESSAGE_TYPES = {
     "GuildMemberSubscription",
 }
 
-# High-frequency English function words and interjections.
-# Used only for the fast density pre-filter — not for final keep/discard decisions.
-# Deliberately excludes short words that are also valid Nepali romanization
-# (e.g. "ma", "ho", "ko", "ta", "na", "ki", "ra") to avoid over-filtering.
+# High-frequency English words used for the fast density pre-filter.
+# Deliberately excludes short words that are also valid romanized Nepali
+# (ma, ho, ko, ta, na, ki, ra, yo, cha, dai, etc.) to avoid over-filtering.
 _COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
     {
         # pronouns & determiners
@@ -309,7 +305,7 @@ _COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
         "small",
         "large",
         "next",
-        # discourse / chat fillers
+        # discourse / chat
         "ok",
         "okay",
         "yeah",
@@ -370,9 +366,7 @@ _COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
         "here",
         "because",
         "if",
-        "when",
         "while",
-        "where",
         "again",
         "take",
         "make",
@@ -399,7 +393,6 @@ _COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
     }
 )
 
-
 # ---------------------------------------------------------------------------
 # Regex helpers
 # ---------------------------------------------------------------------------
@@ -408,27 +401,20 @@ _LATIN_RE = re.compile(r"[a-zA-Z']+")
 
 
 def _latin_words(text: str) -> list[str]:
-    """Return Latin words from text with Devanagari stripped, lowercased."""
     latin_only = _DEVANAGARI_RE.sub(" ", text)
     return [w.lower() for w in _LATIN_RE.findall(latin_only)]
 
 
 # ---------------------------------------------------------------------------
-# Stage-2 heuristic: English word density
+# Stage-2: English density heuristic
 # ---------------------------------------------------------------------------
 def _is_high_english_density(words: list[str]) -> bool:
-    """
-    Return True if the fraction of common English words in *words* meets
-    or exceeds ENGLISH_DENSITY_THRESHOLD.
-
-    Only applied when len(words) >= MIN_LATIN_WORDS (caller's responsibility).
-    """
     en_count = sum(1 for w in words if w in _COMMON_ENGLISH_WORDS)
     return (en_count / len(words)) >= ENGLISH_DENSITY_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
-# Stage-2 + Stage-3 combined filter
+# Stage-2 + Stage-3 filter
 # ---------------------------------------------------------------------------
 def is_romanized_nepali_message(
     cleaned_text: str, lang_filter: NepaliFilter
@@ -437,14 +423,17 @@ def is_romanized_nepali_message(
     Three-stage filter. Returns (keep: bool, reason: str).
     reason is non-empty only when the message is discarded.
 
-    Stage 2 (heuristics, no model):
-      · no-latin         — zero Latin words after Devanagari strip
-      · too-short        — fewer than MIN_LATIN_WORDS Latin words
-      · en-density       — common-English-word density ≥ ENGLISH_DENSITY_THRESHOLD
+    Stage 2 (heuristics, no Lingua):
+      no-latin     — zero Latin words after Devanagari strip
+      too-short    — fewer than MIN_LATIN_WORDS Latin words
+      en-density   — common-English-word density ≥ ENGLISH_DENSITY_THRESHOLD
 
-    Stage 3 (Lingua model):
-      · lingua-EN        — Lingua English confidence ≥ LINGUA_ENGLISH_THRESHOLD
-      · lingua-ES        — Lingua Spanish confidence ≥ LINGUA_SPANISH_THRESHOLD
+    Stage 3 (Lingua, thresholds owned by the NepaliFilter instance):
+      lingua-EN    — English confidence ≥ lang_filter.english_threshold
+      lingua-ES    — Spanish confidence ≥ lang_filter.spanish_threshold
+
+    Note: lang_filter.is_nepali() is deliberately not used here — see module
+    docstring for the reasoning around threshold differences between ETLs.
     """
     if not cleaned_text or not cleaned_text.strip():
         return False, "empty"
@@ -460,10 +449,10 @@ def is_romanized_nepali_message(
     if _is_high_english_density(words):
         return False, "en-density"
 
-    if lang_filter.is_english(cleaned_text, threshold=LINGUA_ENGLISH_THRESHOLD):
+    if lang_filter.is_english(cleaned_text):
         return False, "lingua-EN"
 
-    if lang_filter.is_spanish(cleaned_text, threshold=LINGUA_SPANISH_THRESHOLD):
+    if lang_filter.is_spanish(cleaned_text):
         return False, "lingua-ES"
 
     return True, ""
@@ -483,17 +472,12 @@ def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Robust header extraction using ijson
+# Header extraction
 # ---------------------------------------------------------------------------
 def _read_header_ijson(path: str):
-    """
-    Extract guild and channel by streaming only the first two keys.
-    The huge messages array is never visited.
-    """
     guild: dict = {}
     channel: dict = {}
     with open(path, "rb") as f:
-        f.seek(0)
         try:
             for key, obj in ijson.kvitems(f, ""):
                 if key == "guild":
@@ -508,7 +492,6 @@ def _read_header_ijson(path: str):
 
 
 def _read_header_fallback(path: str):
-    """Fallback using small prefix read (64 KB)."""
     with open(path, "rb") as f:
         prefix = f.read(65536)
     text = prefix.decode("utf-8", errors="replace")
@@ -531,7 +514,6 @@ def _read_header(path: str):
 
 
 def _stream_messages(path: str):
-    """Yield one message dict at a time from the messages array."""
     with open(path, "rb") as f:
         yield from ijson.items(f, "messages.item", use_float=True)
 
@@ -563,7 +545,7 @@ def process_file(
                     discarded,
                 )
 
-            # Stage 1 — system & bot messages
+            # Stage 1
             if msg.get("type") in _SYSTEM_MESSAGE_TYPES:
                 discarded += 1
                 discard_log.debug("[system:%s] %s", msg.get("type"), msg.get("id"))
@@ -625,18 +607,25 @@ def process_file(
 def main(export_dir: str) -> None:
     start = time.time()
     logging.info("Discord ETL starting. Input dir: %s", export_dir)
-    logging.info("Output file: %s (written incrementally)", OUTPUT_FILE)
+    logging.info("Output: %s  |  Discard log: %s", OUTPUT_FILE, DISCARD_LOG)
     logging.info(
-        "Config: MIN_LATIN_WORDS=%d  ENGLISH_DENSITY_THRESHOLD=%.2f  "
-        "LINGUA_EN=%.2f  LINGUA_ES=%.2f  LOW_MEMORY=%s",
+        "Config: MIN_LATIN_WORDS=%d  DENSITY=%.2f  "
+        "EN=%.2f  ES=%.2f  MRD=%.2f  LOW_MEM=%s",
         MIN_LATIN_WORDS,
         ENGLISH_DENSITY_THRESHOLD,
         LINGUA_ENGLISH_THRESHOLD,
         LINGUA_SPANISH_THRESHOLD,
+        LINGUA_MIN_RELATIVE_DISTANCE,
         LINGUA_LOW_MEMORY,
     )
 
-    lang_filter = NepaliFilter(low_memory=LINGUA_LOW_MEMORY)
+    lang_filter = NepaliFilter(
+        english_threshold=LINGUA_ENGLISH_THRESHOLD,
+        spanish_threshold=LINGUA_SPANISH_THRESHOLD,
+        min_relative_distance=LINGUA_MIN_RELATIVE_DISTANCE,
+        low_memory=LINGUA_LOW_MEMORY,
+        # nepali_threshold intentionally omitted — is_nepali() not called here
+    )
 
     all_files = []
     for root, _, files in os.walk(export_dir):
@@ -678,7 +667,7 @@ def main(export_dir: str) -> None:
 
     elapsed = time.time() - start
     logging.info(
-        "Done. %d files | %d messages total | %d kept | %d discarded | %.1fs",
+        "Done. %d files | %d total | %d kept | %d discarded | %.1fs",
         file_count,
         msg_total,
         msg_kept,
