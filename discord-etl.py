@@ -245,36 +245,60 @@ def _resolve_parent_id(msg: dict, channel: dict) -> str | None:
 # Streaming JSON reader
 # ---------------------------------------------------------------------------
 
+# How many bytes to read from the top of the file to find guild + channel.
+# guild and channel are small objects that always appear before the messages
+# array in DiscordChatExporter output.  64 KB is more than enough for any
+# realistic server/channel name, and avoids touching the rest of the file.
+_HEADER_READ_BYTES = 65_536  # 64 KB
+
 
 def _read_header(path: str) -> tuple[dict, dict]:
     """
-    Read only guild and channel from the top of the file using ijson.
-    These are small objects that appear before the messages array.
-    Returns (guild, channel) as plain dicts.
+    Extract guild and channel by reading only the first 64 KB of the file.
+
+    Strategy
+    --------
+    guild and channel are always the first two keys in a DiscordChatExporter
+    JSON file, appearing well before the messages array.  We read a small
+    prefix, truncate it just before the "messages" key so it forms valid JSON,
+    then parse that tiny blob.  The rest of the (possibly multi-GB) file is
+    never touched for this step.
+
+    We intentionally do NOT use ijson here — ijson.kvitems with a break
+    can still read-ahead aggressively depending on the C backend in use,
+    causing OOM on very large files.  A raw 64 KB prefix read is always safe.
     """
-    guild = {}
-    channel = {}
     with open(path, "rb") as f:
-        # Collect all key-value pairs at the top level that are NOT 'messages'
-        parser = ijson.kvitems(f, "")
-        for key, value in parser:
-            if key == "guild":
-                guild = value
-            elif key == "channel":
-                channel = value
-            elif key == "messages":
-                # messages array starts here — stop, we have what we need
-                break
-    return guild, channel
+        prefix = f.read(_HEADER_READ_BYTES)
+
+    text = prefix.decode("utf-8", errors="replace")
+
+    # Truncate at the start of the "messages" key so we have valid JSON.
+    # DiscordChatExporter always writes:  ..., "messages": [
+    cut = text.find('"messages"')
+    if cut == -1:
+        return {}, {}
+
+    # Everything before "messages" — strip trailing comma/whitespace then close
+    stub = text[:cut].rstrip().rstrip(",").rstrip() + "}"
+
+    try:
+        obj = json.loads(stub)
+    except json.JSONDecodeError:
+        return {}, {}
+
+    return obj.get("guild") or {}, obj.get("channel") or {}
 
 
 def _stream_messages(path: str):
     """
     Yield one message dict at a time from the messages array.
-    Peak RAM: one message object (~few KB) regardless of file size.
+    Peak RAM: one message object (~a few KB) regardless of file size.
+    ijson reads the file in small internal chunks (default 64 KB) so the
+    full file is never loaded into memory.
     """
     with open(path, "rb") as f:
-        yield from ijson.items(f, "messages.item")
+        yield from ijson.items(f, "messages.item", use_float=True)
 
 
 # ---------------------------------------------------------------------------
