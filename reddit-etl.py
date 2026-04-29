@@ -74,6 +74,14 @@ Notes
   language-filtering step and downstream consumers may want to treat it
   differently from the body.  Comments use `body` for both.
 
+* Post filtering is decoupled from comment filtering.  A post whose title and
+  body both fail the language filter is not emitted as a post record, but its
+  comments are always scanned independently.  This recovers Nepali comments
+  under English-titled posts — e.g. a post titled "From Tsum Valley hardships
+  to Kathmandu streets..." with a comment "Aru ko dukha bechera khane herne
+  katha" would have been silently dropped by the old coupled logic.  The
+  summary log reports how many discarded posts still yielded Nepali comments.
+
 * parent_uid / thread_uid — for comments, Reddit's `parent_id` field encodes
   the direct parent (t3_ = post, t1_ = another comment) and `link_id` always
   encodes the root post.  Both are stripped of their type prefix and namespaced
@@ -612,6 +620,10 @@ def main(scraped_dir: str) -> None:
     file_count = 0
     post_count = post_discarded = 0
     comment_count = comment_discarded = 0
+    # Posts whose own text failed but whose comments had Nepali content.
+    # Tracked separately so the log makes clear why a "discarded" post still
+    # produced output records.
+    post_skipped_with_nepali_comments = 0
 
     for root, dirs, files in os.walk(scraped_dir):
         for file in sorted(files):
@@ -636,14 +648,19 @@ def main(scraped_dir: str) -> None:
                     kept_post = process_post(post, lang_filter)
                     if kept_post is None:
                         post_discarded += 1
-                        comment_discarded += len(comments)
-                        continue
+                        # Do NOT skip comments here — the post body/title may
+                        # be English while the comment thread is Nepali.
+                        # Example: title "From Tsum Valley hardships to Kathmandu
+                        # streets..." (no signal words) with comment "Aru ko dukha
+                        # bechera khane herne katha" (clearly Nepali).
+                    else:
+                        posts_and_comments.append(
+                            _build_post_record(kept_post, source_file)
+                        )
+                        post_count += 1
 
-                    posts_and_comments.append(
-                        _build_post_record(kept_post, source_file)
-                    )
-                    post_count += 1
-
+                    # Always scan comments, regardless of whether the post passed.
+                    comments_kept_this_post = 0
                     for comment in comments:
                         body = comment.get("text_raw") or ""
                         # Comments use is_nepali() with the conservative
@@ -661,6 +678,15 @@ def main(scraped_dir: str) -> None:
                             _build_comment_record(comment, post["id"], source_file)
                         )
                         comment_count += 1
+                        comments_kept_this_post += 1
+
+                    if kept_post is None and comments_kept_this_post > 0:
+                        post_skipped_with_nepali_comments += 1
+                        logging.debug(
+                            "Post discarded but kept %d comment(s): %s",
+                            comments_kept_this_post,
+                            source_file,
+                        )
 
                 logging.info("Processed: %s", source_file)
 
@@ -670,10 +696,12 @@ def main(scraped_dir: str) -> None:
     elapsed = time.time() - start_time
     logging.info(
         "Done. %d files | %d posts kept | %d posts discarded "
+        "(%d discarded posts had Nepali comments) "
         "| %d comments kept | %d comments discarded | %.2fs",
         file_count,
         post_count,
         post_discarded,
+        post_skipped_with_nepali_comments,
         comment_count,
         comment_discarded,
         elapsed,
