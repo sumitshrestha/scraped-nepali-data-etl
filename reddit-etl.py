@@ -11,25 +11,53 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SCRAPED_DIR = os.getenv("SCRAPED_DIR", "scrapi_reddit_data")
-OUTPUT_FILE = os.getenv("REDDIT_OUTPUT_FILE", "extracted_posts.json")
-LINGUA_NEPALI_THRESHOLD = float(os.getenv("LINGUA_NEPALI_THRESHOLD", "0.85"))
-LINGUA_ENGLISH_THRESHOLD = float(os.getenv("LINGUA_ENGLISH_THRESHOLD", "0.50"))
-LINGUA_SPANISH_THRESHOLD = float(os.getenv("LINGUA_SPANISH_THRESHOLD", "0.50"))
-LINGUA_MIN_RELATIVE_DISTANCE = float(os.getenv("LINGUA_MIN_RELATIVE_DISTANCE", "0.10"))
-LINGUA_LOW_MEMORY = os.getenv("LINGUA_LOW_MEMORY", "false").lower() == "true"
+SCRAPED_DIR = os.getenv("REDDIT_SCRAPED_DIR", "scrapi_reddit_data")
+OUTPUT_FILE = os.getenv("REDDIT_OUTPUT_FILE", "reddit_extracted.json")
+ETL_LOG = os.getenv("REDDIT_ETL_LOG", "reddit_etl.log")
+DISCARD_LOG = os.getenv("REDDIT_DISCARD_LOG", "reddit_discarded.log")
+
+LINGUA_NEPALI_THRESHOLD = float(os.getenv("REDDIT_LINGUA_NEPALI_THRESHOLD", "0.85"))
+LINGUA_ENGLISH_THRESHOLD = float(os.getenv("REDDIT_LINGUA_ENGLISH_THRESHOLD", "0.50"))
+LINGUA_SPANISH_THRESHOLD = float(os.getenv("REDDIT_LINGUA_SPANISH_THRESHOLD", "0.50"))
+LINGUA_MIN_RELATIVE_DISTANCE = float(
+    os.getenv("REDDIT_LINGUA_MIN_RELATIVE_DISTANCE", "0.10")
+)
+LINGUA_LOW_MEMORY = os.getenv("REDDIT_LINGUA_LOW_MEMORY", "false").lower() == "true"
+
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("etl.log", encoding="utf-8"),
-    ],
-)
+def _setup_logging() -> None:
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    # Console + main ETL log file — INFO and above
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+
+    fh = logging.FileHandler(ETL_LOG, mode="a", encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(ch)
+    root.addHandler(fh)
+
+    # Dedicated discard log — plain lines, never echoes to console or ETL log
+    discard_handler = logging.FileHandler(DISCARD_LOG, mode="a", encoding="utf-8")
+    discard_handler.setLevel(logging.DEBUG)
+    discard_handler.setFormatter(logging.Formatter("%(message)s"))
+    discard_handler.addFilter(lambda r: r.name == "discard")
+
+    logging.getLogger("discard").addHandler(discard_handler)
+    logging.getLogger("discard").propagate = False
+
+
+_setup_logging()
+discard_log = logging.getLogger("discard")
+
 
 # ---------------------------------------------------------------------------
 # Romanized Nepali signal words — positive gate for post filtering.
@@ -223,25 +251,39 @@ def parse_post_json(post_json):
 # ---------------------------------------------------------------------------
 # Language filtering
 # ---------------------------------------------------------------------------
-def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter) -> bool:
+def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter, kind: str) -> bool:
     """
     Return True if a single piece of text qualifies as romanized Nepali.
 
     Uses lang_filter.is_nepali() (nepali_threshold, conservative 0.85 by
-    default) so that short ambiguous comments are kept rather than lost.
+    default) so that short ambiguous text is kept rather than lost.
     An additional signal-word gate ensures at least one unambiguously Nepali
     word is present — this catches English sentences that slip past Lingua
     because they are short or contain Nepali proper nouns.
+
+    Parameters
+    ----------
+    kind : str
+        Label used in the discard log ("post-title", "post-content", "comment").
     """
     if not text or not text.strip():
+        discard_log.debug("[empty] <%s>", kind)
         return False
+
     latin_words = {w.lower() for w in lang_filter.latin_words(text)}
+
     if not latin_words:
+        discard_log.debug("[no-latin] <%s> | %s", kind, text[:120])
         return False
+
     if not lang_filter.is_nepali(text):
+        discard_log.debug("[lingua-EN/ES] <%s> | %s", kind, text[:120])
         return False
+
     if not (latin_words & _ROMANIZED_NEPALI_SIGNALS):
+        discard_log.debug("[no-signal] <%s> | %s", kind, text[:120])
         return False
+
     return True
 
 
@@ -254,19 +296,19 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
     Rules
     -----
     - The post is kept if title OR content is romanized Nepali.
-    - A field (title or content) is set to None if it is not romanized Nepali,
-      so downstream consumers only ever see Nepali text.
+    - A field (title or content) is set to None if it does not qualify,
+      so downstream consumers only ever see Nepali text in each field.
 
     Examples
     --------
       title="Financial advice needed"   content="Maile nic asia bank bata..."
-        → title cleared (English, no signal), content kept    → KEEP
+        → title cleared (no signal), content kept              → KEEP
 
       title="Tokla tea bags ma cha hola?" content=None
-        → title kept (signal: cha, hola), content stays None  → KEEP
+        → title kept (signal: cha, hola)                      → KEEP
 
       title="Best affordable hotel in Kathmandu" content=None
-        → title cleared (English, "Kathmandu" is not a signal) → DISCARD
+        → title cleared ("Kathmandu" is not a signal)         → DISCARD
 
       title="वैशाख १२"                  content=None
         → title cleared (Devanagari, no Latin words)          → DISCARD
@@ -277,8 +319,8 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
     title = post_flat.get("title") or ""
     content = post_flat.get("content") or ""
 
-    title_ok = _is_romanized_nepali_text(title, lang_filter)
-    content_ok = _is_romanized_nepali_text(content, lang_filter)
+    title_ok = _is_romanized_nepali_text(title, lang_filter, "post-title")
+    content_ok = _is_romanized_nepali_text(content, lang_filter, "post-content")
 
     if not title_ok and not content_ok:
         return None
@@ -295,7 +337,12 @@ def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
 def main(scraped_dir: str) -> None:
     start_time = time.time()
     logging.info("Reddit ETL starting. Input dir: %s", scraped_dir)
-    logging.info("Output: %s", OUTPUT_FILE)
+    logging.info(
+        "Output: %s  |  ETL log: %s  |  Discard log: %s",
+        OUTPUT_FILE,
+        ETL_LOG,
+        DISCARD_LOG,
+    )
     logging.info(
         "Config: NEPALI=%.2f  EN=%.2f  ES=%.2f  MRD=%.2f  LOW_MEM=%s",
         LINGUA_NEPALI_THRESHOLD,
@@ -319,7 +366,7 @@ def main(scraped_dir: str) -> None:
     comment_count = comment_discarded = 0
 
     for root, dirs, files in os.walk(scraped_dir):
-        for file in files:
+        for file in sorted(files):
             if not file.endswith(".json"):
                 continue
 
@@ -342,11 +389,6 @@ def main(scraped_dir: str) -> None:
                     if cleaned is None:
                         post_discarded += 1
                         comment_discarded += len(comments)
-                        logging.debug(
-                            "Discarded post %s: %s",
-                            post_flat.get("id"),
-                            post_flat.get("title", "")[:60],
-                        )
                         continue
 
                     posts_and_comments.append(cleaned)
@@ -355,13 +397,13 @@ def main(scraped_dir: str) -> None:
                     for comment in comments:
                         body = comment.get("body") or ""
                         # Comments use is_nepali() with the conservative
-                        # nepali_threshold (default 0.85): short romanized
+                        # nepali_threshold (0.85 by default): short romanized
                         # Nepali comments look ambiguous to Lingua so we keep
-                        # anything that isn't clearly EN/ES.
+                        # anything not clearly EN/ES.
                         if not lang_filter.is_nepali(body):
                             comment_discarded += 1
-                            logging.debug(
-                                "Discarded comment %s: not Nepali", comment.get("id")
+                            discard_log.debug(
+                                "[lingua-EN/ES] <comment> | %s", body[:120]
                             )
                             continue
 
@@ -378,7 +420,7 @@ def main(scraped_dir: str) -> None:
 
     elapsed = time.time() - start_time
     logging.info(
-        "Processed %d files | %d posts kept | %d posts discarded "
+        "Done. %d files | %d posts kept | %d posts discarded "
         "| %d comments kept | %d comments discarded | %.2fs",
         file_count,
         post_count,
