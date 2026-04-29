@@ -1,10 +1,111 @@
+"""
+reddit-etl.py
+=============
+ETL for Reddit JSON exports scraped via the Reddit API (PRAW / Scrapy /
+custom scrapers).  Reads a directory of .json files, filters for romanized
+Nepali content, and writes a flat JSON array of records in the shared
+canonical schema consumed by the downstream merge/load ETL.
+
+Canonical output schema (one record per post or comment)
+---------------------------------------------------------
+{
+  # --- Identity ---
+  "uid":            "reddit:1sybbj5",          # globally unique across platforms
+  "source_id":      "1sybbj5",                 # raw Reddit post/comment id
+  "kind":           "post" | "comment",
+  "platform":       "reddit",
+
+  # --- Author ---
+  "author_name":    "ResistAdept641",           # display name (may be [deleted])
+  "author_id":      "t2_kfdwapyk",             # Reddit author_fullname (stable t2_ id)
+
+  # --- Content ---
+  "text":           "...",                      # cleaned body (or cleaned selftext)
+  "text_raw":       "...",                      # raw body before clean_text()
+
+  # --- Threading ---
+  "parent_uid":     null | "reddit:oitdma8",   # direct parent (null for posts)
+  "thread_uid":     null | "reddit:1sybbj5",   # root post (null for posts)
+
+  # --- Timestamps ---
+  "created_utc":    1777403974.0,              # Unix epoch float, always present
+
+  # --- Provenance ---
+  "source_file":    "best/post_jsons/014_...", # relative path within scraped_dir
+
+  # --- Platform-specific ---
+  "platform_meta": {
+    # Posts only:
+    "subreddit":      "Nepal",
+    "subreddit_id":   "t5_2qs6h",
+    "title":          "...",                   # raw title (unfiltered)
+    "title_clean":    "...",                   # title after clean_text()
+    "score":          42,
+    "upvote_ratio":   0.95,
+    "num_comments":   7,
+    "permalink":      "/r/Nepal/comments/...",
+    "url":            "https://...",
+    "is_self":        true,
+    "over_18":        false,
+    "post_type":      "self",                  # post_hint or type field
+    "name":           "t3_1sybbj5",           # Reddit fullname (t3_ prefixed id)
+
+    # Comments only:
+    "subreddit":      "Nepal",
+    "subreddit_id":   "t5_2qs6h",
+    "score":          1,
+    "permalink":      "/r/Nepal/comments/.../oitdma8/",
+    "depth":          0,
+    "controversiality": 0,
+    "name":           "t1_oitdma8",
+  }
+}
+
+Notes
+-----
+* uid  — prefixed with "reddit:" so records from discord-etl.py ("discord:")
+  can coexist in a single DB table or merged JSON file without id collisions.
+
+* author_id — Reddit's `author_fullname` field (e.g. "t2_kfdwapyk").  Present
+  on most API responses; None when the account is deleted or the field is absent.
+
+* text / text_raw — posts use selftext as the body.  title is kept separately
+  in platform_meta.title / platform_meta.title_clean because it has its own
+  language-filtering step and downstream consumers may want to treat it
+  differently from the body.  Comments use `body` for both.
+
+* parent_uid / thread_uid — for comments, Reddit's `parent_id` field encodes
+  the direct parent (t3_ = post, t1_ = another comment) and `link_id` always
+  encodes the root post.  Both are stripped of their type prefix and namespaced
+  as "reddit:<id>" to produce uid-compatible references.
+
+* created_utc — Reddit API returns this as a float Unix epoch.  No conversion
+  needed; stored as-is.
+
+* source_file — relative path from scraped_dir, e.g.
+  "best/post_jsons/014_20260428_1sybbj5_...json"
+
+Configuration  (all via .env or environment variables)
+------------------------------------------------------
+  REDDIT_SCRAPED_DIR                  Input dir       (default: scrapi_reddit_data)
+  REDDIT_OUTPUT_FILE                  Output path     (default: reddit_extracted.json)
+  REDDIT_ETL_LOG                      ETL log         (default: reddit_etl.log)
+  REDDIT_DISCARD_LOG                  Discard log     (default: reddit_discarded.log)
+  REDDIT_LINGUA_NEPALI_THRESHOLD      default 0.85
+  REDDIT_LINGUA_ENGLISH_THRESHOLD     default 0.50
+  REDDIT_LINGUA_SPANISH_THRESHOLD     default 0.50
+  REDDIT_LINGUA_MIN_RELATIVE_DISTANCE default 0.10
+  REDDIT_LINGUA_LOW_MEMORY            default false
+"""
+
 import os
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-from lang_filter import NepaliFilter
+from lang_filter import NepaliFilter, clean_text
 
 load_dotenv()
 
@@ -31,7 +132,6 @@ LINGUA_LOW_MEMORY = os.getenv("REDDIT_LINGUA_LOW_MEMORY", "false").lower() == "t
 def _setup_logging() -> None:
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    # Console + main ETL log file — INFO and above
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch.setFormatter(fmt)
@@ -45,7 +145,6 @@ def _setup_logging() -> None:
     root.addHandler(ch)
     root.addHandler(fh)
 
-    # Dedicated discard log — plain lines, never echoes to console or ETL log
     discard_handler = logging.FileHandler(DISCARD_LOG, mode="a", encoding="utf-8")
     discard_handler.setLevel(logging.DEBUG)
     discard_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -60,16 +159,9 @@ discard_log = logging.getLogger("discard")
 
 
 # ---------------------------------------------------------------------------
-# Romanized Nepali signal words — positive gate for post filtering.
-# A post with no Devanagari must contain at least one of these to be kept.
-# Words are grammatically Nepali (particles, verb forms, pronouns,
-# postpositions) — things that would never appear in a natural English or
-# Spanish sentence. Proper nouns (Kathmandu, Nepali, Pokhara) are
-# intentionally excluded: they appear in English sentences about Nepal
-# constantly and give no signal that the *language* of the text is Nepali.
+# Romanized Nepali signal words  (unchanged from original)
 # ---------------------------------------------------------------------------
 _ROMANIZED_NEPALI_SIGNALS = {
-    # Postpositions / case markers
     "lai",
     "bata",
     "sanga",
@@ -80,7 +172,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "dekhi",
     "tiir",
     "tira",
-    # Particles
     "pani",
     "nai",
     "chai",
@@ -95,7 +186,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "purai",
     "ali",
     "dherai",
-    # Pronouns / determiners
     "yo",
     "tyo",
     "yо",
@@ -104,7 +194,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "tei",
     "afu",
     "afai",
-    # Common verb stems / conjugated forms
     "cha",
     "chha",
     "chau",
@@ -146,7 +235,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "milena",
     "sakcha",
     "sakina",
-    # Common Nepali-only nouns / adjectives (not place names)
     "manchhe",
     "manche",
     "saathi",
@@ -166,7 +254,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "sukha",
     "kasto",
     "kasari",
-    # Time / discourse words
     "aaja",
     "hijo",
     "bholi",
@@ -178,7 +265,6 @@ _ROMANIZED_NEPALI_SIGNALS = {
     "kina",
     "kei",
     "kehi",
-    # Common discourse / filler (unique to Nepali)
     "yar",
     "yaar",
     "haina",
@@ -192,36 +278,104 @@ _ROMANIZED_NEPALI_SIGNALS = {
 
 
 # ---------------------------------------------------------------------------
+# uid helpers
+# ---------------------------------------------------------------------------
+
+
+def _reddit_uid(raw_id: str | None) -> str | None:
+    """Prefix a bare Reddit id with 'reddit:' to make a cross-platform uid."""
+    if not raw_id:
+        return None
+    return f"reddit:{raw_id}"
+
+
+def _strip_type_prefix(fullname: str | None) -> str | None:
+    """
+    Convert a Reddit fullname like 't3_1sybbj5' or 't1_oitdma8' to the bare
+    id '1sybbj5' / 'oitdma8' so it can be wrapped in _reddit_uid().
+    Returns None if the input is absent or malformed.
+    """
+    if not fullname:
+        return None
+    if "_" in fullname:
+        return fullname.split("_", 1)[1]
+    return fullname
+
+
+# ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
-def extract_post_info(post):
+
+
+def extract_post_info(post: dict) -> dict:
+    """
+    Extract everything we need from a raw Reddit post data dict.
+
+    Preserves fields needed for both the canonical envelope and platform_meta.
+    The 'comments' key is a staging list populated by parse_post_json — it
+    is popped before the record is written.
+    """
     return {
+        # canonical fields
         "id": post.get("id"),
-        "title": post.get("title"),
-        "content": post.get("selftext") or post.get("body"),
-        "author": post.get("author"),
+        "author_name": post.get("author"),
+        "author_id": post.get("author_fullname"),  # "t2_kfdwapyk"
         "created_utc": post.get("created_utc"),
-        "type": post.get("post_hint") or post.get("type"),
+        # content — raw values; clean_text() applied later
+        "title_raw": post.get("title") or "",
+        "text_raw": post.get("selftext") or post.get("body") or "",
+        # platform_meta fields
+        "subreddit": post.get("subreddit"),
+        "subreddit_id": post.get("subreddit_id"),
+        "score": post.get("score"),
+        "upvote_ratio": post.get("upvote_ratio"),
+        "num_comments": post.get("num_comments"),
+        "permalink": post.get("permalink"),
+        "url": post.get("url"),
+        "is_self": post.get("is_self"),
+        "over_18": post.get("over_18"),
+        "post_type": post.get("post_hint") or post.get("type"),
+        "name": post.get("name"),  # "t3_1sybbj5"
+        # staging only — popped before output
         "comments": [],
     }
 
 
-def extract_comment_info(comment):
+def extract_comment_info(comment: dict) -> dict:
+    """
+    Extract everything we need from a raw Reddit comment data dict.
+
+    parent_id / link_id are Reddit fullnames (t3_xxx / t1_xxx).
+    They are converted to uid-style references when the record is assembled.
+    """
     return {
+        # canonical fields
         "id": comment.get("id"),
-        "author": comment.get("author"),
-        "body": comment.get("body"),
+        "author_name": comment.get("author"),
+        "author_id": comment.get("author_fullname"),  # "t2_..."
         "created_utc": comment.get("created_utc"),
+        "text_raw": comment.get("body") or "",
+        # threading — Reddit fullnames, converted to uids later
+        "_parent_fullname": comment.get("parent_id"),  # "t3_xxx" or "t1_xxx"
+        "_link_fullname": comment.get("link_id"),  # always "t3_xxx" (root post)
+        # platform_meta fields
+        "subreddit": comment.get("subreddit"),
+        "subreddit_id": comment.get("subreddit_id"),
+        "score": comment.get("score"),
+        "permalink": comment.get("permalink"),
+        "depth": comment.get("depth"),
+        "controversiality": comment.get("controversiality"),
+        "name": comment.get("name"),  # "t1_oitdma8"
     }
 
 
-def parse_post_json(post_json):
+def parse_post_json(post_json) -> list[dict] | None:
     """
     Parse Reddit JSON into a list of post dicts (each with a 'comments' key).
 
     Handles two shapes:
-      - list  → single post + comments  (individual post JSON files)
-      - dict  → listing of posts        (posts.json / links.json)
+      - list  → single post + its comments  (individual post JSON files)
+      - dict  → listing of posts            (posts.json / links.json)
 
     Returns a list of post dicts, or None if the structure is unrecognised.
     """
@@ -249,22 +403,130 @@ def parse_post_json(post_json):
 
 
 # ---------------------------------------------------------------------------
-# Language filtering
+# Record assembly — canonical envelope
 # ---------------------------------------------------------------------------
+
+
+def _build_post_record(post: dict, source_file: str) -> dict:
+    """
+    Assemble the canonical envelope for a kept post.
+
+    post  — the dict returned by extract_post_info() (comments already popped).
+    The title / text fields passed in here have already passed the language
+    filter; process_post() sets them to None if they failed — so we fall back
+    to empty string for clean_text() calls.
+    """
+    title_raw = post.get("title_raw") or ""
+    text_raw = post.get("text_raw") or ""
+    title_clean = clean_text(title_raw)
+    text_clean = clean_text(text_raw)
+
+    return {
+        # --- Identity ---
+        "uid": _reddit_uid(post["id"]),
+        "source_id": post["id"],
+        "kind": "post",
+        "platform": "reddit",
+        # --- Author ---
+        "author_name": post.get("author_name"),
+        "author_id": post.get("author_id"),
+        # --- Content ---
+        "text": text_clean or None,
+        "text_raw": text_raw or None,
+        # --- Threading (posts have no parent) ---
+        "parent_uid": None,
+        "thread_uid": None,
+        # --- Timestamps ---
+        "created_utc": post.get("created_utc"),
+        # --- Provenance ---
+        "source_file": source_file,
+        # --- Platform-specific ---
+        "platform_meta": {
+            "subreddit": post.get("subreddit"),
+            "subreddit_id": post.get("subreddit_id"),
+            "title": title_raw or None,
+            "title_clean": title_clean or None,
+            "score": post.get("score"),
+            "upvote_ratio": post.get("upvote_ratio"),
+            "num_comments": post.get("num_comments"),
+            "permalink": post.get("permalink"),
+            "url": post.get("url"),
+            "is_self": post.get("is_self"),
+            "over_18": post.get("over_18"),
+            "post_type": post.get("post_type"),
+            "name": post.get("name"),
+        },
+    }
+
+
+def _build_comment_record(comment: dict, post_id: str, source_file: str) -> dict:
+    """
+    Assemble the canonical envelope for a kept comment.
+
+    comment  — dict returned by extract_comment_info().
+    post_id  — bare id of the containing post (used as thread_uid fallback).
+
+    Threading:
+      parent_uid — direct parent.  If _parent_fullname is "t3_xxx" the comment
+                   is a top-level reply to the post; uid becomes "reddit:xxx".
+                   If "t1_xxx" it's a reply to another comment.
+      thread_uid — always the root post, derived from _link_fullname ("t3_xxx")
+                   or falling back to post_id.
+    """
+    text_raw = comment.get("text_raw") or ""
+    text_clean = clean_text(text_raw)
+
+    parent_bare = _strip_type_prefix(comment.get("_parent_fullname"))
+    link_bare = _strip_type_prefix(comment.get("_link_fullname")) or post_id
+
+    return {
+        # --- Identity ---
+        "uid": _reddit_uid(comment["id"]),
+        "source_id": comment["id"],
+        "kind": "comment",
+        "platform": "reddit",
+        # --- Author ---
+        "author_name": comment.get("author_name"),
+        "author_id": comment.get("author_id"),
+        # --- Content ---
+        "text": text_clean or None,
+        "text_raw": text_raw or None,
+        # --- Threading ---
+        "parent_uid": _reddit_uid(parent_bare),
+        "thread_uid": _reddit_uid(link_bare),
+        # --- Timestamps ---
+        "created_utc": comment.get("created_utc"),
+        # --- Provenance ---
+        "source_file": source_file,
+        # --- Platform-specific ---
+        "platform_meta": {
+            "subreddit": comment.get("subreddit"),
+            "subreddit_id": comment.get("subreddit_id"),
+            "score": comment.get("score"),
+            "permalink": comment.get("permalink"),
+            "depth": comment.get("depth"),
+            "controversiality": comment.get("controversiality"),
+            "name": comment.get("name"),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Language filtering  (logic unchanged from original)
+# ---------------------------------------------------------------------------
+
+
 def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter, kind: str) -> bool:
     """
     Return True if a single piece of text qualifies as romanized Nepali.
 
-    Uses lang_filter.is_nepali() (nepali_threshold, conservative 0.85 by
-    default) so that short ambiguous text is kept rather than lost.
-    An additional signal-word gate ensures at least one unambiguously Nepali
-    word is present — this catches English sentences that slip past Lingua
-    because they are short or contain Nepali proper nouns.
-
-    Parameters
-    ----------
-    kind : str
-        Label used in the discard log ("post-title", "post-content", "comment").
+    Decision pipeline
+    -----------------
+    1. Empty / whitespace only                            → DISCARD
+    2. Zero Latin words after Devanagari strip            → DISCARD
+    3. Lingua: text is not Nepali (nepali_threshold)      → DISCARD
+    4. No signal word from _ROMANIZED_NEPALI_SIGNALS      → DISCARD
+    5. Otherwise                                          → KEEP
     """
     if not text or not text.strip():
         discard_log.debug("[empty] <%s>", kind)
@@ -287,53 +549,39 @@ def _is_romanized_nepali_text(text: str, lang_filter: NepaliFilter, kind: str) -
     return True
 
 
-def process_post(post_flat: dict, lang_filter: NepaliFilter) -> dict | None:
+def process_post(post: dict, lang_filter: NepaliFilter) -> dict | None:
     """
-    Decide whether to keep a post and strip any non-Nepali fields.
+    Decide whether to keep a post.
 
-    Returns a cleaned post dict if it should be kept, or None to discard.
+    Returns the post dict (with title_raw / text_raw cleared if a field failed
+    the language filter) or None to discard the entire post.
 
     Rules
     -----
-    - The post is kept if title OR content is romanized Nepali.
-    - A field (title or content) is set to None if it does not qualify,
-      so downstream consumers only ever see Nepali text in each field.
-
-    Examples
-    --------
-      title="Financial advice needed"   content="Maile nic asia bank bata..."
-        → title cleared (no signal), content kept              → KEEP
-
-      title="Tokla tea bags ma cha hola?" content=None
-        → title kept (signal: cha, hola)                      → KEEP
-
-      title="Best affordable hotel in Kathmandu" content=None
-        → title cleared ("Kathmandu" is not a signal)         → DISCARD
-
-      title="वैशाख १२"                  content=None
-        → title cleared (Devanagari, no Latin words)          → DISCARD
-
-      title="Minor road accident"       content="Hijo 22 April accident bhayo..."
-        → title cleared (English), content kept (bhayo)       → KEEP
+    - Post is kept if title OR body qualifies as romanized Nepali.
+    - A field that fails is set to "" so _build_post_record() produces None
+      for those content fields rather than writing non-Nepali text.
     """
-    title = post_flat.get("title") or ""
-    content = post_flat.get("content") or ""
+    title_raw = post.get("title_raw") or ""
+    text_raw = post.get("text_raw") or ""
 
-    title_ok = _is_romanized_nepali_text(title, lang_filter, "post-title")
-    content_ok = _is_romanized_nepali_text(content, lang_filter, "post-content")
+    title_ok = _is_romanized_nepali_text(title_raw, lang_filter, "post-title")
+    content_ok = _is_romanized_nepali_text(text_raw, lang_filter, "post-content")
 
     if not title_ok and not content_ok:
         return None
 
-    result = dict(post_flat)
-    result["title"] = title if title_ok else None
-    result["content"] = content if content_ok else None
+    result = dict(post)
+    result["title_raw"] = title_raw if title_ok else ""
+    result["text_raw"] = text_raw if content_ok else ""
     return result
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+
 def main(scraped_dir: str) -> None:
     start_time = time.time()
     logging.info("Reddit ETL starting. Input dir: %s", scraped_dir)
@@ -360,7 +608,7 @@ def main(scraped_dir: str) -> None:
         low_memory=LINGUA_LOW_MEMORY,
     )
 
-    posts_and_comments = []
+    posts_and_comments: list[dict] = []
     file_count = 0
     post_count = post_discarded = 0
     comment_count = comment_discarded = 0
@@ -371,7 +619,9 @@ def main(scraped_dir: str) -> None:
                 continue
 
             path = os.path.join(root, file)
+            source_file = os.path.relpath(path, scraped_dir)
             file_count += 1
+
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -381,25 +631,25 @@ def main(scraped_dir: str) -> None:
                     continue
 
                 for post in parsed:
-                    post_flat = dict(post)
-                    post_flat["kind"] = "post"
-                    comments = post_flat.pop("comments", [])
+                    comments = post.pop("comments", [])
 
-                    cleaned = process_post(post_flat, lang_filter)
-                    if cleaned is None:
+                    kept_post = process_post(post, lang_filter)
+                    if kept_post is None:
                         post_discarded += 1
                         comment_discarded += len(comments)
                         continue
 
-                    posts_and_comments.append(cleaned)
+                    posts_and_comments.append(
+                        _build_post_record(kept_post, source_file)
+                    )
                     post_count += 1
 
                     for comment in comments:
-                        body = comment.get("body") or ""
+                        body = comment.get("text_raw") or ""
                         # Comments use is_nepali() with the conservative
                         # nepali_threshold (0.85 by default): short romanized
-                        # Nepali comments look ambiguous to Lingua so we keep
-                        # anything not clearly EN/ES.
+                        # Nepali looks ambiguous to Lingua so we keep anything
+                        # not clearly EN/ES.
                         if not lang_filter.is_nepali(body):
                             comment_discarded += 1
                             discard_log.debug(
@@ -407,13 +657,12 @@ def main(scraped_dir: str) -> None:
                             )
                             continue
 
-                        comment_flat = dict(comment)
-                        comment_flat["kind"] = "comment"
-                        comment_flat["post_id"] = post_flat["id"]
-                        posts_and_comments.append(comment_flat)
+                        posts_and_comments.append(
+                            _build_comment_record(comment, post["id"], source_file)
+                        )
                         comment_count += 1
 
-                logging.info("Processed: %s", path)
+                logging.info("Processed: %s", source_file)
 
             except Exception as e:
                 logging.error("Error reading %s: %s", path, e)
