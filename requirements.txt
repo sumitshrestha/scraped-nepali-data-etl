@@ -1,4 +1,4 @@
 python-dotenv
 lingua-language-detector
 ijson
-# backports.zoneinfo; python_version<'3.9'  # Uncomment if you use zoneinfo and need Python <3.9 support
+pymongo
