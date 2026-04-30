@@ -30,6 +30,9 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/?replicaSet=rs0")
+MONGO_USER = os.getenv("MONGO_USER")
+MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
+MONGO_AUTH_SOURCE = os.getenv("MONGO_AUTH_SOURCE", "admin")
 MONGO_DB = os.getenv("MONGO_DB", "nepali_corpus")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "nepali_text_corpus")
 
@@ -265,7 +268,13 @@ def reduce_batch(mapped_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 class MongoDBLoadOrchestrator:
     def __init__(self):
-        self.client = MongoClient(MONGO_URI)
+        client_kwargs = {}
+        if MONGO_USER and MONGO_PASSWORD:
+            client_kwargs["username"] = MONGO_USER
+            client_kwargs["password"] = MONGO_PASSWORD
+            client_kwargs["authSource"] = MONGO_AUTH_SOURCE
+
+        self.client = MongoClient(MONGO_URI, **client_kwargs)
         self.db = self.client[MONGO_DB]
         self.collection = self.db[MONGO_COLLECTION].with_options(
             write_concern=WriteConcern(w="majority", j=True)
