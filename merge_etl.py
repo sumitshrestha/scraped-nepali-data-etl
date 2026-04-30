@@ -15,6 +15,7 @@ import hashlib
 import logging
 import ijson
 import itertools
+from decimal import Decimal
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Tuple, Set
@@ -118,6 +119,13 @@ def map_one_record(record: dict, origin_script: str) -> Optional[Dict[str, Any]]
     has_sentence_boundary = bool(re.search(r"[.?!]", cleaned))
     english_ratio = round(len(english_indices) / token_count, 4) if token_count else 0.0
 
+    created_utc = record.get("created_utc")
+    if created_utc is not None:
+        try:
+            created_utc = float(created_utc)
+        except (ValueError, TypeError):
+            created_utc = None
+
     return {
         "cleaned_text": cleaned,
         "value": {
@@ -126,7 +134,7 @@ def map_one_record(record: dict, origin_script: str) -> Optional[Dict[str, Any]]
             "platform": record.get("platform"),
             "origin_script": origin_script,
             "source_context": extract_source_context(record),
-            "created_utc": record.get("created_utc"),
+            "created_utc": created_utc,
             "platform_meta_sample": record.get("platform_meta") or {},
             "linguistic_profile": {
                 "token_count": token_count,
