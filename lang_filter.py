@@ -166,6 +166,204 @@ def _latin_words(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Common English words used by the Devanagari-dominance check in is_nepali().
+#
+# This is intentionally a compact set of the highest-frequency English words
+# — function words, pronouns, common verbs, greetings, and internet slang —
+# that would never appear in romanized Nepali.  It is NOT meant to be
+# exhaustive: its only job is to catch short English tails on Devanagari-
+# dominant text (e.g. "Happy new year", "Good morning", "nice bro") without
+# adding a dependency on the larger set in discord-etl.py.
+# ---------------------------------------------------------------------------
+
+_COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
+    {
+        # Pronouns / determiners
+        "i",
+        "you",
+        "he",
+        "she",
+        "we",
+        "they",
+        "it",
+        "me",
+        "him",
+        "her",
+        "us",
+        "my",
+        "your",
+        "his",
+        "our",
+        "their",
+        "its",
+        "this",
+        "that",
+        "these",
+        # To-be / auxiliary
+        "am",
+        "are",
+        "is",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "can",
+        # Contractions (apostrophe stripped by clean_text)
+        "im",
+        "ive",
+        "id",
+        "youre",
+        "youve",
+        "youll",
+        "dont",
+        "doesnt",
+        "wont",
+        "cant",
+        "isnt",
+        "wasnt",
+        "arent",
+        "hes",
+        "shes",
+        "weve",
+        "theyre",
+        # Articles / conjunctions / prepositions
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "as",
+        "about",
+        "than",
+        "into",
+        # Common verbs
+        "get",
+        "got",
+        "go",
+        "gone",
+        "come",
+        "know",
+        "think",
+        "want",
+        "need",
+        "see",
+        "look",
+        "like",
+        "love",
+        "hate",
+        "make",
+        "take",
+        "give",
+        "keep",
+        "watch",
+        "listen",
+        # Adverbs / adjectives
+        "not",
+        "just",
+        "very",
+        "too",
+        "so",
+        "really",
+        "also",
+        "here",
+        "there",
+        "now",
+        "good",
+        "great",
+        "nice",
+        "new",
+        "best",
+        "happy",
+        "beautiful",
+        "amazing",
+        "awesome",
+        "sad",
+        "bad",
+        "big",
+        "old",
+        # Greetings / discourse (highest-value for catching EN tails on Deva text)
+        "hello",
+        "hi",
+        "hey",
+        "bye",
+        "goodbye",
+        "welcome",
+        "thanks",
+        "thank",
+        "please",
+        "sorry",
+        "congratulations",
+        "congrats",
+        "enjoy",
+        "wish",
+        "wishes",
+        "blessed",
+        "bless",
+        # Time / calendar words (catch "Happy new year", "good morning" etc.)
+        "year",
+        "day",
+        "morning",
+        "night",
+        "today",
+        "yesterday",
+        "tomorrow",
+        "happy",
+        "merry",
+        "celebrate",
+        "celebration",
+        # Internet / social
+        "lol",
+        "lmao",
+        "omg",
+        "wow",
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "sure",
+        "bro",
+        "dude",
+        "sir",
+        "guys",
+        "man",
+        # Numbers-as-words that appear in English greetings
+        "one",
+        "two",
+        "three",
+        "all",
+        "every",
+        "everyone",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
 # NepaliFilter
 # ---------------------------------------------------------------------------
 
@@ -195,6 +393,15 @@ class NepaliFilter:
         Passed to Lingua's builder.  Minimum score gap between the top two
         language candidates before Lingua will commit to a language.
         Lower = fires more often on short/ambiguous text.  Default 0.10.
+    deva_dominance_ratio : float
+        If the fraction of Devanagari words among all words (Devanagari +
+        Latin) meets or exceeds this value, the text is considered
+        "Devanagari-dominant".  In that mode is_nepali() uses the more
+        aggressive english_threshold (not the conservative nepali_threshold)
+        when evaluating the Latin portion, and also fast-discards if all
+        Latin words are common English.  This catches patterns like
+        "२०८३ मा स्वागत छ Happy new year" that are Devanagari comments
+        with an English greeting tacked on.  Default 0.60.
     low_memory : bool
         When True, load only EN+ES+NE models (~50 MB) instead of all 75
         (~1 GB).  Auto-enabled when free RAM < 1.2 GB (requires psutil).
@@ -207,11 +414,13 @@ class NepaliFilter:
         english_threshold: float = 0.50,
         spanish_threshold: float = 0.50,
         min_relative_distance: float = 0.10,
+        deva_dominance_ratio: float = 0.60,
         low_memory: bool = False,
     ) -> None:
         self.nepali_threshold = nepali_threshold
         self.english_threshold = english_threshold
         self.spanish_threshold = spanish_threshold
+        self.deva_dominance_ratio = deva_dominance_ratio
 
         # Auto-detect memory pressure
         if not low_memory:
@@ -242,12 +451,14 @@ class NepaliFilter:
 
         mode = "low-memory" if low_memory else "full"
         log.info(
-            "NepaliFilter ready [%s | nepali=%.0f%% EN=%.0f%% ES=%.0f%% mrd=%.2f]",
+            "NepaliFilter ready [%s | nepali=%.0f%% EN=%.0f%% ES=%.0f%% "
+            "mrd=%.2f deva_dom=%.0f%%]",
             mode,
             nepali_threshold * 100,
             english_threshold * 100,
             spanish_threshold * 100,
             min_relative_distance,
+            deva_dominance_ratio * 100,
         )
 
     # ------------------------------------------------------------------
@@ -292,7 +503,7 @@ class NepaliFilter:
 
     def is_nepali(self, text: str) -> bool:
         """
-        Return True if text should be kept as Nepali content.
+        Return True if text should be kept as romanized Nepali content.
 
         Uses self.nepali_threshold (default 0.85) — conservative, so that
         romanized Nepali which looks ambiguous to Lingua is kept rather than
@@ -301,13 +512,26 @@ class NepaliFilter:
         Decision pipeline
         -----------------
         1. Clean text (strip emoji, mentions, URLs)
-        2. Empty / whitespace only               → DISCARD
-        3. Has Devanagari, zero Latin words      → DISCARD  (purely Devanagari)
-        4. Zero Latin words (emoji / nums only)  → DISCARD
-        5. Lingua on Latin-only portion:
-               ENGLISH confidence ≥ nepali_threshold  → DISCARD
-               SPANISH confidence ≥ nepali_threshold  → DISCARD
-               anything else                          → KEEP
+        2. Empty / whitespace only                        → DISCARD
+        3. Has Devanagari, zero Latin words               → DISCARD
+           (purely Devanagari — no romanized content)
+        4. Zero Latin words (emoji / nums only)           → DISCARD
+        5. Devanagari-dominance check
+           If deva_words / (deva_words + latin_words) ≥ deva_dominance_ratio:
+             a. All Latin words are common English words  → DISCARD
+                (fast path, no Lingua call needed)
+             b. Lingua English confidence ≥ english_threshold → DISCARD
+                (aggressive threshold — we are judging a short English tail,
+                not an ambiguous romanized Nepali body)
+             c. Lingua Spanish confidence ≥ english_threshold → DISCARD
+           This step catches patterns like "२०८३ मा स्वागत छ Happy new year"
+           — predominantly Devanagari with a greeting-only Latin tail — that
+           would slip past step 6 because the conservative nepali_threshold
+           is intentionally high to protect short romanized Nepali.
+        6. Full Lingua check on the Latin-only portion:
+               ENGLISH confidence ≥ nepali_threshold      → DISCARD
+               SPANISH confidence ≥ nepali_threshold      → DISCARD
+               anything else                              → KEEP
         """
         stripped = clean_text(text)
         if not stripped:
@@ -316,11 +540,32 @@ class NepaliFilter:
         deva = _devanagari_words(stripped)
         latin = _latin_words(stripped)
 
+        # Step 3 — purely Devanagari
         if deva and not latin:
             return False
+
+        # Step 4 — no Latin at all
         if not latin:
             return False
 
+        # Step 5 — Devanagari-dominant mixed text
+        total_words = len(deva) + len(latin)
+        if total_words > 0 and (len(deva) / total_words) >= self.deva_dominance_ratio:
+            latin_lower = {w.lower() for w in latin}
+
+            # 5a — fast path: all Latin words are common English, no Lingua needed
+            if latin_lower.issubset(_COMMON_ENGLISH_WORDS):
+                return False
+
+            # 5b/5c — Lingua with aggressive english_threshold
+            latin_text = " ".join(latin)
+            conf = self.confidence_map(latin_text)
+            if conf.get(Language.ENGLISH, 0) >= self.english_threshold:
+                return False
+            if conf.get(Language.SPANISH, 0) >= self.english_threshold:
+                return False
+
+        # Step 6 — standard Lingua check for non-dominant-Devanagari text
         latin_text = " ".join(latin)
         conf = self.confidence_map(latin_text)
 
