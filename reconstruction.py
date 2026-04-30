@@ -24,7 +24,17 @@ class ReconstructionService:
         if not self.mongo_uri:
             raise EnvironmentError("MONGO_URI is not set.")
 
-        self.client = MongoClient(self.mongo_uri)
+        mongo_user = os.environ.get("MONGO_USER")
+        mongo_password = os.environ.get("MONGO_PASSWORD")
+        mongo_auth_source = os.environ.get("MONGO_AUTH_SOURCE", "admin")
+
+        client_kwargs = {}
+        if mongo_user and mongo_password:
+            client_kwargs["username"] = mongo_user
+            client_kwargs["password"] = mongo_password
+            client_kwargs["authSource"] = mongo_auth_source
+
+        self.client = MongoClient(self.mongo_uri, **client_kwargs)
         self.db = self.client[self.db_name]
 
         # Collections
