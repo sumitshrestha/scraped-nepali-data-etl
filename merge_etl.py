@@ -13,6 +13,8 @@ import json
 import time
 import hashlib
 import logging
+import ijson
+import itertools
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Tuple, Set
@@ -410,6 +412,16 @@ class MongoDBLoadOrchestrator:
 # ---------------------------------------------------------------------------
 # Pipeline Orchestration
 # ---------------------------------------------------------------------------
+def chunked_iterable(iterable, size):
+    """Yields successive n-sized chunks from an iterable."""
+    it = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(it, size))
+        if not chunk:
+            break
+        yield chunk
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -453,30 +465,33 @@ def main():
 
             logging.info(f"MAP: streaming {fpath} (origin: {origin_script})")
 
-            with open(fpath, "r", encoding="utf-8") as f:
-                records = json.load(f)
+            # Stream JSON array iteratively
+            with open(fpath, "rb") as f:
+                records = ijson.items(f, 'item')
+                chunk_size = max(BATCH_SIZE * MAP_WORKERS, 5000)
+                
+                for chunk in chunked_iterable(records, chunk_size):
+                    # Map Phase (Parallel)
+                    futures = [
+                        executor.submit(map_one_record, rec, origin_script) for rec in chunk
+                    ]
 
-            # Map Phase (Parallel)
-            futures = [
-                executor.submit(map_one_record, rec, origin_script) for rec in records
-            ]
+                    for future in as_completed(futures):
+                        total_read += 1
+                        result = future.result()
 
-            for future in as_completed(futures):
-                total_read += 1
-                result = future.result()
+                        if result:
+                            mapped_batch.append(result)
 
-                if result:
-                    mapped_batch.append(result)
+                        # Reduce & Load when batch limit is reached (Constraint 5.1 & 5.3)
+                        if len(mapped_batch) >= BATCH_SIZE:
+                            reduced_docs = reduce_batch(mapped_batch)
+                            orchestrator.load_batch(reduced_docs)
+                            reconstruction.update_uid_index(reduced_docs)
+                            mapped_batch.clear()
 
-                # Reduce & Load when batch limit is reached (Constraint 5.1 & 5.3)
-                if len(mapped_batch) >= BATCH_SIZE:
-                    reduced_docs = reduce_batch(mapped_batch)
-                    orchestrator.load_batch(reduced_docs)
-                    reconstruction.update_uid_index(reduced_docs)
-                    mapped_batch.clear()
-
-                if total_read % LOG_EVERY == 0:
-                    logging.info(f"  ... {total_read} records mapped")
+                        if total_read % LOG_EVERY == 0:
+                            logging.info(f"  ... {total_read} records mapped")
 
     # Final flush for remaining items
     if mapped_batch:
