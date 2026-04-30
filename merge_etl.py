@@ -100,10 +100,26 @@ def annotate_tokens(cleaned_text: str) -> Tuple[int, List[int]]:
 # ---------------------------------------------------------------------------
 # Component 3: The Map Worker (Executed in parallel processes)
 # ---------------------------------------------------------------------------
+def convert_decimals(obj):
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            obj[i] = convert_decimals(obj[i])
+        return obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            obj[k] = convert_decimals(v)
+        return obj
+    elif isinstance(obj, Decimal):
+        # Convert precisely: if no fractional part, int, else float
+        return int(obj) if obj % 1 == 0 else float(obj)
+    return obj
+
+
 def map_one_record(record: dict, origin_script: str) -> Optional[Dict[str, Any]]:
     """
     Pure function for CPU-bound mapping. Safe for ProcessPoolExecutor.
     """
+    record = convert_decimals(record)
     text_raw = record.get("text_raw") or record.get("text") or ""
     if not text_raw.strip():
         return None
@@ -475,7 +491,7 @@ def main():
 
             # Stream JSON array iteratively
             with open(fpath, "rb") as f:
-                records = ijson.items(f, 'item')
+                records = ijson.items(f, 'item', use_float=True)
                 chunk_size = max(BATCH_SIZE * MAP_WORKERS, 5000)
                 
                 for chunk in chunked_iterable(records, chunk_size):
