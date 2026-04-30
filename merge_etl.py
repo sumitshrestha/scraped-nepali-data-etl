@@ -34,7 +34,7 @@ MONGO_DB = os.getenv("MONGO_DB", "nepali_corpus")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "nepali_text_corpus")
 
 INPUT_FILES = os.getenv(
-    "INPUT_FILES", "reddit_extracted.json,youtube_extracted.json,discord_extracted.json"
+    "INPUT_FILES", "filtered_etl_output"
 ).split(",")
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "1000"))
@@ -411,18 +411,28 @@ def main():
     orchestrator.ensure_indexes()
 
     # Leverage the ReconstructionService (Component 6) to keep uid_index updated
-    reconstruction = ReconstructionService(etl_output_dir=".")
+    reconstruction = ReconstructionService(etl_output_dir="filtered_etl_output")
 
     mapped_batch = []
     total_read = 0
 
-    with ProcessPoolExecutor(max_workers=MAP_WORKERS) as executor:
-        for fpath in INPUT_FILES:
-            fpath = fpath.strip()
-            if not os.path.exists(fpath):
-                logging.warning(f"File not found, skipping: {fpath}")
-                continue
+    all_files_to_process = []
+    for path in INPUT_FILES:
+        path = path.strip()
+        if not os.path.exists(path):
+            logging.warning(f"Path not found, skipping: {path}")
+            continue
+        if os.path.isdir(path):
+            for root, _, files in os.walk(path):
+                for file in files:
+                    if file.endswith(".json"):
+                        all_files_to_process.append(os.path.join(root, file))
+        else:
+            if path.endswith(".json"):
+                all_files_to_process.append(path)
 
+    with ProcessPoolExecutor(max_workers=MAP_WORKERS) as executor:
+        for fpath in all_files_to_process:
             # Infer origin script from filename
             origin_script = "unknown-etl.py"
             if "reddit" in fpath.lower():

@@ -121,9 +121,9 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 SCRAPED_DIR = os.getenv("REDDIT_SCRAPED_DIR", "scrapi_reddit_data")
-OUTPUT_FILE = os.getenv("REDDIT_OUTPUT_FILE", "reddit_extracted.json")
-ETL_LOG = os.getenv("REDDIT_ETL_LOG", "reddit_etl.log")
-DISCARD_LOG = os.getenv("REDDIT_DISCARD_LOG", "reddit_discarded.log")
+OUTPUT_FILE = os.getenv("REDDIT_OUTPUT_FILE", os.path.join("filtered_etl_output", "reddit_extracted.json"))
+ETL_LOG = os.getenv("REDDIT_ETL_LOG", os.path.join("etl_logs", "reddit_etl.log"))
+DISCARD_LOG = os.getenv("REDDIT_DISCARD_LOG", os.path.join("etl_logs", "reddit_discarded.log"))
 
 LINGUA_NEPALI_THRESHOLD = float(os.getenv("REDDIT_LINGUA_NEPALI_THRESHOLD", "0.85"))
 LINGUA_ENGLISH_THRESHOLD = float(os.getenv("REDDIT_LINGUA_ENGLISH_THRESHOLD", "0.50"))
@@ -138,6 +138,11 @@ LINGUA_LOW_MEMORY = os.getenv("REDDIT_LINGUA_LOW_MEMORY", "false").lower() == "t
 # Logging
 # ---------------------------------------------------------------------------
 def _setup_logging() -> None:
+    for log_path in [ETL_LOG, DISCARD_LOG]:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     ch = logging.StreamHandler()
@@ -708,6 +713,9 @@ def main(scraped_dir: str) -> None:
     )
 
     try:
+        out_dir = os.path.dirname(OUTPUT_FILE)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
             json.dump(posts_and_comments, out, indent=2, ensure_ascii=False)
         logging.info("Results saved to %s", OUTPUT_FILE)

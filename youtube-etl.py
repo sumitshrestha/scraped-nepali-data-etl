@@ -144,9 +144,9 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 INPUT_DIR   = os.getenv("YOUTUBE_INPUT_DIR",   "nepali_comments")
-OUTPUT_FILE = os.getenv("YOUTUBE_OUTPUT_FILE", "youtube_extracted.json")
-ETL_LOG     = os.getenv("YOUTUBE_ETL_LOG",     "youtube_etl.log")
-DISCARD_LOG = os.getenv("YOUTUBE_DISCARD_LOG", "youtube_discarded.log")
+OUTPUT_FILE = os.getenv("YOUTUBE_OUTPUT_FILE", os.path.join("filtered_etl_output", "youtube_extracted.json"))
+ETL_LOG     = os.getenv("YOUTUBE_ETL_LOG",     os.path.join("etl_logs", "youtube_etl.log"))
+DISCARD_LOG = os.getenv("YOUTUBE_DISCARD_LOG", os.path.join("etl_logs", "youtube_discarded.log"))
 SUMMARY_FILE = os.getenv(
     "YOUTUBE_SUMMARY_FILE", os.path.join(INPUT_DIR, "summary.json")
 )
@@ -162,6 +162,11 @@ LINGUA_LOW_MEMORY            = os.getenv("YOUTUBE_LINGUA_LOW_MEMORY", "false").l
 # Logging
 # ---------------------------------------------------------------------------
 def _setup_logging() -> None:
+    for log_path in [ETL_LOG, DISCARD_LOG]:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     ch = logging.StreamHandler()
@@ -518,6 +523,9 @@ def main(input_dir: str) -> None:
         )
 
     try:
+        out_dir = os.path.dirname(OUTPUT_FILE)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as out:
             json.dump(results, out, indent=2, ensure_ascii=False)
         logging.info("Results saved to %s", OUTPUT_FILE)

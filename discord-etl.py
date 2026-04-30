@@ -121,9 +121,9 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 EXPORT_DIR = os.getenv("DISCORD_EXPORT_DIR", "discord_exports")
-OUTPUT_FILE = os.getenv("DISCORD_OUTPUT_FILE", "discord_extracted.json")
-ETL_LOG = os.getenv("DISCORD_ETL_LOG", "discord_etl.log")
-DISCARD_LOG = os.getenv("DISCORD_DISCARD_LOG", "discord_discarded.log")
+OUTPUT_FILE = os.getenv("DISCORD_OUTPUT_FILE", os.path.join("filtered_etl_output", "discord_extracted.json"))
+ETL_LOG = os.getenv("DISCORD_ETL_LOG", os.path.join("etl_logs", "discord_etl.log"))
+DISCARD_LOG = os.getenv("DISCORD_DISCARD_LOG", os.path.join("etl_logs", "discord_discarded.log"))
 LOG_EVERY = int(os.getenv("DISCORD_LOG_EVERY", "10000"))
 
 MIN_LATIN_WORDS = int(os.getenv("DISCORD_MIN_LATIN_WORDS", "3"))
@@ -141,6 +141,11 @@ LINGUA_LOW_MEMORY = os.getenv("DISCORD_LINGUA_LOW_MEMORY", "false").lower() == "
 # Logging
 # ---------------------------------------------------------------------------
 def _setup_logging() -> None:
+    for log_path in [ETL_LOG, DISCARD_LOG]:
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
     ch = logging.StreamHandler()
@@ -724,6 +729,10 @@ def main(export_dir: str) -> None:
 
     file_count = 0
     msg_total = msg_kept = msg_discarded = 0
+
+    out_dir = os.path.dirname(OUTPUT_FILE)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out_f:
         out_f.write("[")
