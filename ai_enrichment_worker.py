@@ -252,7 +252,7 @@ class AIEnrichmentWorker:
             "system": SYSTEM_PROMPT,
             "format": "json",
             "stream": False,
-            "options": {"temperature": 0.1},
+            "options": {"temperature": 0.1, "num_predict": -1},
         }
 
         response = requests.post(
@@ -361,6 +361,22 @@ class AIEnrichmentWorker:
             self._queue_retry_increment(item.doc_id)
 
     def _handle_batch_items(self, items: List[PreparedItem]) -> None:
+    @staticmethod
+    def _salvage_partial_batch(raw: str) -> Optional[Dict[str, Any]]:
+        """Extract complete entries from a truncated batch JSON response."""
+        # Match complete entries: "N": {"devanagari": "...", "profanity_score": X.X}
+        pattern = re.compile(
+            r'"(\d+)"\s*:\s*\{\s*"devanagari"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"profanity_score"\s*:\s*([0-9]*\.?[0-9]+)\s*\}'
+        )
+        results: Dict[str, Any] = {}
+        for m in pattern.finditer(raw):
+            results[m.group(1)] = {
+                "devanagari": m.group(2),
+                "profanity_score": float(m.group(3)),
+            }
+        return results if results else None
+
+    def _handle_batch_items(self, items: List[PreparedItem]) -> None:
         if not items:
             return
 
@@ -386,10 +402,12 @@ class AIEnrichmentWorker:
             time.sleep(TIMEOUT_RECOVERY_SECONDS)
             return
         except json.JSONDecodeError:
-            logging.warning("Batch JSON parse failure raw=%s", raw)
-            for item in items:
-                self._queue_retry_increment(item.doc_id)
-            return
+            logging.warning("Batch JSON parse failure (truncated?), attempting partial salvage. raw_prefix=%s", raw[:120])
+            parsed = self._salvage_partial_batch(raw)
+            if not parsed:
+                for item in items:
+                    self._queue_retry_increment(item.doc_id)
+                return
         except (ValidationError, requests.RequestException) as exc:
             logging.warning("Batch request/validation failure error=%s", exc)
             for item in items:
@@ -397,7 +415,7 @@ class AIEnrichmentWorker:
             return
 
         for key, item in idx_to_item.items():
-            entry = parsed.get(key)
+            entry = parsed.get(key) if isinstance(parsed, dict) else None
             if not isinstance(entry, dict):
                 self._queue_retry_increment(item.doc_id)
                 continue
