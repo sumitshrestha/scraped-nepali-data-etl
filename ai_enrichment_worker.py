@@ -112,7 +112,7 @@ class AIEnrichmentWorker:
     def _fetch_cursor(self):
         query = {
             "ai_slots.devanagari_translation": None,
-            "ai_slots.retry_count": {"$lt": MAX_RETRY_COUNT},
+            "ai_slots.retry_count": {"$not": {"$gte": MAX_RETRY_COUNT}},
         }
         return (
             self.collection.find(query)
