@@ -218,8 +218,8 @@ class AIEnrichmentWorker:
             "on a scale of 0.0 (clean) to 1.0 (highly profane) in Nepali cultural "
             "context.\n"
             "Respond ONLY with a valid JSON object in this exact format:\n"
-            "{\"devanagari\": \"<converted text>\", \"profanity_score\": <float>}\n"
-            f"Text: \"{prepared_text}\""
+            '{"devanagari": "<converted text>", "profanity_score": <float>}\n'
+            f'Text: "{prepared_text}"'
         )
 
     def _build_batch_prompt(self, payload_json: str) -> str:
@@ -236,9 +236,9 @@ class AIEnrichmentWorker:
             f"{payload_json}\n"
             "Expected output format:\n"
             "{\n"
-            "  \"0\": {\"devanagari\": \"कसम\", \"profanity_score\": 0.0},\n"
-            "  \"1\": {\"devanagari\": \"वाउ [ENG_0] पार्टी\", \"profanity_score\": 0.0},\n"
-            "  \"2\": {\"devanagari\": \"चुस न त\", \"profanity_score\": 0.9}\n"
+            '  "0": {"devanagari": "कसम", "profanity_score": 0.0},\n'
+            '  "1": {"devanagari": "वाउ [ENG_0] पार्टी", "profanity_score": 0.0},\n'
+            '  "2": {"devanagari": "चुस न त", "profanity_score": 0.9}\n'
             "}\n"
             "Now process this input:\n"
             f"{payload_json}"
@@ -311,7 +311,9 @@ class AIEnrichmentWorker:
         )
 
     def _queue_retry_increment(self, doc_id: str) -> None:
-        self.pending_ops.append(UpdateOne({"_id": doc_id}, {"$inc": {"ai_slots.retry_count": 1}}))
+        self.pending_ops.append(
+            UpdateOne({"_id": doc_id}, {"$inc": {"ai_slots.retry_count": 1}})
+        )
 
     def _flush_bulk_updates(self, force: bool = False) -> None:
         if not self.pending_ops:
@@ -341,7 +343,9 @@ class AIEnrichmentWorker:
             if not isinstance(parsed, dict):
                 raise ValidationError("single response must be a JSON object")
 
-            devanagari, profanity = self._validate_result_object(item.prepared_text, parsed)
+            devanagari, profanity = self._validate_result_object(
+                item.prepared_text, parsed
+            )
             rehydrated = self._rehydrate_placeholders(devanagari, item.placeholder_map)
             self._queue_success_update(
                 item.doc_id,
@@ -357,10 +361,11 @@ class AIEnrichmentWorker:
             logging.warning("JSON parse failure for doc_id=%s raw=%s", item.doc_id, raw)
             self._queue_retry_increment(item.doc_id)
         except (ValidationError, requests.RequestException) as exc:
-            logging.warning("Validation/request failure for doc_id=%s error=%s", item.doc_id, exc)
+            logging.warning(
+                "Validation/request failure for doc_id=%s error=%s", item.doc_id, exc
+            )
             self._queue_retry_increment(item.doc_id)
 
-    def _handle_batch_items(self, items: List[PreparedItem]) -> None:
     @staticmethod
     def _salvage_partial_batch(raw: str) -> Optional[Dict[str, Any]]:
         """Extract complete entries from a truncated batch JSON response."""
@@ -402,7 +407,10 @@ class AIEnrichmentWorker:
             time.sleep(TIMEOUT_RECOVERY_SECONDS)
             return
         except json.JSONDecodeError:
-            logging.warning("Batch JSON parse failure (truncated?), attempting partial salvage. raw_prefix=%s", raw[:120])
+            logging.warning(
+                "Batch JSON parse failure (truncated?), attempting partial salvage. raw_prefix=%s",
+                raw[:120],
+            )
             parsed = self._salvage_partial_batch(raw)
             if not parsed:
                 for item in items:
@@ -421,8 +429,12 @@ class AIEnrichmentWorker:
                 continue
 
             try:
-                devanagari, profanity = self._validate_result_object(item.prepared_text, entry)
-                rehydrated = self._rehydrate_placeholders(devanagari, item.placeholder_map)
+                devanagari, profanity = self._validate_result_object(
+                    item.prepared_text, entry
+                )
+                rehydrated = self._rehydrate_placeholders(
+                    devanagari, item.placeholder_map
+                )
                 self._queue_success_update(
                     item.doc_id,
                     rehydrated,
@@ -476,7 +488,10 @@ class AIEnrichmentWorker:
         while True:
             seen = self.process_once()
             if seen == 0:
-                logging.info("No eligible documents found. Sleeping for %ss", POLL_INTERVAL_SECONDS)
+                logging.info(
+                    "No eligible documents found. Sleeping for %ss",
+                    POLL_INTERVAL_SECONDS,
+                )
                 time.sleep(POLL_INTERVAL_SECONDS)
 
     def close(self) -> None:
@@ -484,7 +499,9 @@ class AIEnrichmentWorker:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+    )
 
     worker = AIEnrichmentWorker()
     try:
