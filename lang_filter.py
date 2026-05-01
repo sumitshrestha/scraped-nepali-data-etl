@@ -78,11 +78,13 @@ Public API
 Dependencies
 ------------
     pip install lingua-language-detector
+    pip install wordfreq
 """
 
 import re
 import logging
 from lingua import Language, LanguageDetectorBuilder
+from wordfreq import top_n_list
 
 log = logging.getLogger(__name__)
 
@@ -168,198 +170,14 @@ def _latin_words(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Common English words used by the Devanagari-dominance check in is_nepali().
 #
-# This is intentionally a compact set of the highest-frequency English words
-# — function words, pronouns, common verbs, greetings, and internet slang —
-# that would never appear in romanized Nepali.  It is NOT meant to be
-# exhaustive: its only job is to catch short English tails on Devanagari-
-# dominant text (e.g. "Happy new year", "Good morning", "nice bro") without
-# adding a dependency on the larger set in discord-etl.py.
+# Uses wordfreq top-N vocabulary (same approach as ai_enrichment_worker.py)
+# rather than a fixed hardcoded list. This keeps coverage broader while
+# making the threshold explicit and easy to tune in code.
 # ---------------------------------------------------------------------------
 
+_COMMON_ENGLISH_TOPN = 40000
 _COMMON_ENGLISH_WORDS: frozenset[str] = frozenset(
-    {
-        # Pronouns / determiners
-        "i",
-        "you",
-        "he",
-        "she",
-        "we",
-        "they",
-        "it",
-        "me",
-        "him",
-        "her",
-        "us",
-        "my",
-        "your",
-        "his",
-        "our",
-        "their",
-        "its",
-        "this",
-        "that",
-        "these",
-        # To-be / auxiliary
-        "am",
-        "are",
-        "is",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "have",
-        "has",
-        "had",
-        "do",
-        "does",
-        "did",
-        "will",
-        "would",
-        "could",
-        "should",
-        "shall",
-        "may",
-        "might",
-        "must",
-        "can",
-        # Contractions (apostrophe stripped by clean_text)
-        "im",
-        "ive",
-        "id",
-        "youre",
-        "youve",
-        "youll",
-        "dont",
-        "doesnt",
-        "wont",
-        "cant",
-        "isnt",
-        "wasnt",
-        "arent",
-        "hes",
-        "shes",
-        "weve",
-        "theyre",
-        # Articles / conjunctions / prepositions
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "so",
-        "in",
-        "on",
-        "at",
-        "to",
-        "for",
-        "of",
-        "with",
-        "by",
-        "from",
-        "as",
-        "about",
-        "than",
-        "into",
-        # Common verbs
-        "get",
-        "got",
-        "go",
-        "gone",
-        "come",
-        "know",
-        "think",
-        "want",
-        "need",
-        "see",
-        "look",
-        "like",
-        "love",
-        "hate",
-        "make",
-        "take",
-        "give",
-        "keep",
-        "watch",
-        "listen",
-        # Adverbs / adjectives
-        "not",
-        "just",
-        "very",
-        "too",
-        "so",
-        "really",
-        "also",
-        "here",
-        "there",
-        "now",
-        "good",
-        "great",
-        "nice",
-        "new",
-        "best",
-        "happy",
-        "beautiful",
-        "amazing",
-        "awesome",
-        "sad",
-        "bad",
-        "big",
-        "old",
-        # Greetings / discourse (highest-value for catching EN tails on Deva text)
-        "hello",
-        "hi",
-        "hey",
-        "bye",
-        "goodbye",
-        "welcome",
-        "thanks",
-        "thank",
-        "please",
-        "sorry",
-        "congratulations",
-        "congrats",
-        "enjoy",
-        "wish",
-        "wishes",
-        "blessed",
-        "bless",
-        # Time / calendar words (catch "Happy new year", "good morning" etc.)
-        "year",
-        "day",
-        "morning",
-        "night",
-        "today",
-        "yesterday",
-        "tomorrow",
-        "happy",
-        "merry",
-        "celebrate",
-        "celebration",
-        # Internet / social
-        "lol",
-        "lmao",
-        "omg",
-        "wow",
-        "yes",
-        "no",
-        "ok",
-        "okay",
-        "sure",
-        "bro",
-        "dude",
-        "sir",
-        "guys",
-        "man",
-        # Numbers-as-words that appear in English greetings
-        "one",
-        "two",
-        "three",
-        "all",
-        "every",
-        "everyone",
-    }
+    top_n_list("en", _COMMON_ENGLISH_TOPN)
 )
 
 

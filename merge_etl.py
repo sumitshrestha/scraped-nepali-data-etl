@@ -268,6 +268,8 @@ def reduce_batch(mapped_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "variants": variants,
             "ai_slots": {
                 "devanagari_translation": None,
+                "profanity_score": None,
+                "retry_count": 0,
                 "model_confidence": None,
                 "model_version": None,
                 "translated_at": None,
