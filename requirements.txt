@@ -2,5 +2,6 @@ python-dotenv
 lingua-language-detector
 ijson
 pymongo
-requests
+aiohttp
+tiktoken
 wordfreq
