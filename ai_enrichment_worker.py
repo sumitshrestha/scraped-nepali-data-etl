@@ -38,6 +38,22 @@ CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
 LLM_REQUEST_TIMEOUT_SECONDS = int(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"))
 MAX_RETRY_COUNT = int(os.getenv("MAX_RETRY_COUNT", "3"))
 WORDFREQ_ENGLISH_TOPN = int(os.getenv("WORDFREQ_ENGLISH_TOPN", "40000"))
+WARMUP_PROBE_ENABLED = os.getenv("WARMUP_PROBE_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+WARMUP_HIGH_LATENCY_SECONDS = float(os.getenv("WARMUP_HIGH_LATENCY_SECONDS", "8"))
+WARMUP_TIMEOUT_SECONDS = float(os.getenv("WARMUP_TIMEOUT_SECONDS", "20"))
+MEMORY_GUARD_ENABLED = os.getenv("MEMORY_GUARD_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MEMORY_GUARD_TRIGGER_EVENTS = int(os.getenv("MEMORY_GUARD_TRIGGER_EVENTS", "3"))
+MEMORY_GUARD_COOLDOWN_SECONDS = int(os.getenv("MEMORY_GUARD_COOLDOWN_SECONDS", "45"))
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/?replicaSet=rs0")
 MONGO_USER = os.getenv("MONGO_USER")
@@ -123,6 +139,109 @@ _DEFAULT_CAPABILITIES = ModelCapabilities(
     supports_concurrency=False,
 )
 
+# Provider-level fallbacks: used when an exact model key is absent from
+# MODEL_REGISTRY so that unknown models still inherit the right strategy.
+PROVIDER_DEFAULTS: Dict[str, ModelCapabilities] = {
+    "ollama": ModelCapabilities(
+        max_context_tokens=8192,
+        optimal_batch_size=12,
+        rate_limit_rpm=0,
+        supports_concurrency=False,
+    ),
+    "cloud": ModelCapabilities(
+        max_context_tokens=16_384,
+        optimal_batch_size=16,
+        rate_limit_rpm=500,
+        supports_concurrency=True,
+    ),
+}
+
+_MODEL_SIZE_B_RE = re.compile(r"(\d+)\s*b", re.IGNORECASE)
+_MEMORY_PRESSURE_RE = re.compile(
+    r"out\s+of\s+memory|oom|cuda\s+out\s+of\s+memory|insufficient\s+memory",
+    re.IGNORECASE,
+)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse optional integer env var with safe fallback."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logging.warning(
+            "Invalid integer for %s=%r. Using default=%d", name, raw, default
+        )
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse optional float env var with safe fallback."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        logging.warning("Invalid float for %s=%r. Using default=%s", name, raw, default)
+        return default
+
+
+def _infer_ollama_capabilities(model_name: str) -> ModelCapabilities:
+    """Infer conservative defaults for unknown Ollama models.
+
+    Larger models typically leave less headroom for batching on the same machine,
+    so we reduce optimal batch size as parameter count grows.
+    """
+    model_lower = model_name.lower()
+    match = _MODEL_SIZE_B_RE.search(model_lower)
+    model_size_b = int(match.group(1)) if match else None
+
+    if model_size_b is None:
+        base = PROVIDER_DEFAULTS["ollama"]
+    elif model_size_b >= 60:
+        base = ModelCapabilities(
+            max_context_tokens=4096,
+            optimal_batch_size=2,
+            rate_limit_rpm=0,
+            supports_concurrency=False,
+        )
+    elif model_size_b >= 30:
+        base = ModelCapabilities(
+            max_context_tokens=6144,
+            optimal_batch_size=4,
+            rate_limit_rpm=0,
+            supports_concurrency=False,
+        )
+    elif model_size_b >= 14:
+        base = ModelCapabilities(
+            max_context_tokens=8192,
+            optimal_batch_size=8,
+            rate_limit_rpm=0,
+            supports_concurrency=False,
+        )
+    else:
+        base = ModelCapabilities(
+            max_context_tokens=8192,
+            optimal_batch_size=12,
+            rate_limit_rpm=0,
+            supports_concurrency=False,
+        )
+
+    return ModelCapabilities(
+        max_context_tokens=max(
+            256, _env_int("OLLAMA_MAX_CONTEXT_TOKENS", base.max_context_tokens)
+        ),
+        optimal_batch_size=max(
+            1, _env_int("OLLAMA_OPTIMAL_BATCH_SIZE", base.optimal_batch_size)
+        ),
+        rate_limit_rpm=max(0, _env_int("OLLAMA_RATE_LIMIT_RPM", base.rate_limit_rpm)),
+        supports_concurrency=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Lightweight token counter (tiktoken when available, word-count heuristic otherwise)
 # ---------------------------------------------------------------------------
@@ -195,13 +314,32 @@ class PreparedItem:
 
 class AIEnrichmentWorker:
     def __init__(self) -> None:
-        self.capabilities: ModelCapabilities = MODEL_REGISTRY.get(
-            ACTIVE_MODEL_KEY, _DEFAULT_CAPABILITIES
-        )
-        if ACTIVE_MODEL_KEY not in MODEL_REGISTRY:
-            logging.warning(
-                "Model key '%s' not found in MODEL_REGISTRY. Using default capabilities.",
+        if ACTIVE_MODEL_KEY in MODEL_REGISTRY:
+            self.capabilities: ModelCapabilities = MODEL_REGISTRY[ACTIVE_MODEL_KEY]
+        elif LLM_PROVIDER == "ollama":
+            self.capabilities = _infer_ollama_capabilities(LLM_MODEL)
+            logging.info(
+                "Model key '%s' not in MODEL_REGISTRY — inferred Ollama caps: "
+                "max_context_tokens=%d optimal_batch_size=%d",
                 ACTIVE_MODEL_KEY,
+                self.capabilities.max_context_tokens,
+                self.capabilities.optimal_batch_size,
+            )
+        elif LLM_PROVIDER in PROVIDER_DEFAULTS:
+            self.capabilities = PROVIDER_DEFAULTS[LLM_PROVIDER]
+            logging.info(
+                "Model key '%s' not in MODEL_REGISTRY — using provider-level "
+                "defaults for '%s'.",
+                ACTIVE_MODEL_KEY,
+                LLM_PROVIDER,
+            )
+        else:
+            self.capabilities = _DEFAULT_CAPABILITIES
+            logging.warning(
+                "Model key '%s' and provider '%s' both unknown — "
+                "falling back to generic defaults.",
+                ACTIVE_MODEL_KEY,
+                LLM_PROVIDER,
             )
 
         self.aimd = AIMDState(
@@ -224,6 +362,145 @@ class AIEnrichmentWorker:
         self.collection: Collection = self.client[MONGO_DB][MONGO_COLLECTION]
 
         self.pending_ops: List[UpdateOne] = []
+        self.memory_guard_trigger_events = max(
+            1, _env_int("MEMORY_GUARD_TRIGGER_EVENTS", MEMORY_GUARD_TRIGGER_EVENTS)
+        )
+        self.memory_guard_cooldown_seconds = max(
+            1, _env_int("MEMORY_GUARD_COOLDOWN_SECONDS", MEMORY_GUARD_COOLDOWN_SECONDS)
+        )
+        self.consecutive_pressure_events = 0
+        self.memory_guard_cooldown_until = 0.0
+
+    def _is_memory_guard_active(self) -> bool:
+        return time.monotonic() < self.memory_guard_cooldown_until
+
+    @staticmethod
+    def _is_memory_pressure_text(text: str) -> bool:
+        return bool(_MEMORY_PRESSURE_RE.search(text))
+
+    def _apply_memory_guard_cap(self) -> None:
+        if not MEMORY_GUARD_ENABLED:
+            return
+        if self._is_memory_guard_active() and self.aimd.current_limit != 1:
+            old = self.aimd.current_limit
+            self.aimd.current_limit = 1
+            remaining = max(0.0, self.memory_guard_cooldown_until - time.monotonic())
+            logging.warning(
+                "Memory guard active: forcing AIMD %s %d -> 1 (cooldown %.1fs remaining)",
+                self.aimd.label,
+                old,
+                remaining,
+            )
+
+    def _record_pressure_event(self, reason: str) -> None:
+        if not MEMORY_GUARD_ENABLED:
+            return
+        self.consecutive_pressure_events += 1
+        logging.warning(
+            "Memory guard pressure event %d/%d: %s",
+            self.consecutive_pressure_events,
+            self.memory_guard_trigger_events,
+            reason,
+        )
+        if self.consecutive_pressure_events >= self.memory_guard_trigger_events:
+            self.memory_guard_cooldown_until = (
+                time.monotonic() + self.memory_guard_cooldown_seconds
+            )
+            old = self.aimd.current_limit
+            self.aimd.current_limit = 1
+            self.consecutive_pressure_events = 0
+            logging.warning(
+                "Memory guard triggered: AIMD %s %d -> 1 for %ds cooldown",
+                self.aimd.label,
+                old,
+                self.memory_guard_cooldown_seconds,
+            )
+
+    def _record_clean_success(self) -> None:
+        if not MEMORY_GUARD_ENABLED:
+            return
+        if self.consecutive_pressure_events > 0:
+            self.consecutive_pressure_events = 0
+
+    async def _run_startup_warmup_probe(self) -> None:
+        """Probe first-request behavior and reduce AIMD start limit when needed.
+
+        This protects memory-constrained/slow nodes from starting with a limit
+        that is too aggressive for the active model-machine combination.
+        """
+        if not WARMUP_PROBE_ENABLED:
+            logging.info("Warm-up probe disabled by config.")
+            return
+
+        timeout_seconds = max(
+            1.0, _env_float("WARMUP_TIMEOUT_SECONDS", WARMUP_TIMEOUT_SECONDS)
+        )
+        high_latency_seconds = max(
+            0.5,
+            _env_float("WARMUP_HIGH_LATENCY_SECONDS", WARMUP_HIGH_LATENCY_SECONDS),
+        )
+
+        probe_prompt = self._build_single_prompt("namaste sathi")
+        started = time.perf_counter()
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                raw = await asyncio.wait_for(
+                    self._call_llm_async(session, probe_prompt),
+                    timeout=timeout_seconds,
+                )
+
+            parsed = json.loads(self._strip_markdown_fences(raw))
+            if not isinstance(parsed, dict):
+                raise ValidationError("warm-up response must be a JSON object")
+
+            elapsed = time.perf_counter() - started
+            if elapsed > high_latency_seconds:
+                old_limit = self.aimd.current_limit
+                self.aimd.on_failure()
+                self._record_pressure_event("warmup-high-latency")
+                logging.warning(
+                    "Warm-up latency %.2fs exceeded threshold %.2fs. "
+                    "Reducing initial AIMD %s %d -> %d",
+                    elapsed,
+                    high_latency_seconds,
+                    self.aimd.label,
+                    old_limit,
+                    self.aimd.current_limit,
+                )
+            else:
+                self._record_clean_success()
+                logging.info(
+                    "Warm-up probe healthy (latency=%.2fs <= %.2fs). "
+                    "Keeping initial AIMD %s=%d",
+                    elapsed,
+                    high_latency_seconds,
+                    self.aimd.label,
+                    self.aimd.current_limit,
+                )
+        except asyncio.TimeoutError:
+            old_limit = self.aimd.current_limit
+            self.aimd.on_failure()
+            self._record_pressure_event("warmup-timeout")
+            logging.warning(
+                "Warm-up probe timed out at %.2fs. Reducing initial AIMD %s %d -> %d",
+                timeout_seconds,
+                self.aimd.label,
+                old_limit,
+                self.aimd.current_limit,
+            )
+            await asyncio.sleep(min(2, TIMEOUT_RECOVERY_SECONDS))
+        except Exception as exc:
+            old_limit = self.aimd.current_limit
+            self.aimd.on_failure()
+            self._record_pressure_event(f"warmup-error:{exc}")
+            logging.warning(
+                "Warm-up probe failed (%s). Reducing initial AIMD %s %d -> %d",
+                exc,
+                self.aimd.label,
+                old_limit,
+                self.aimd.current_limit,
+            )
 
     def log_poisoned_count(self) -> None:
         poisoned = self.collection.count_documents(
@@ -555,6 +832,8 @@ class AIEnrichmentWorker:
         if not items:
             return
 
+        self._apply_memory_guard_cap()
+
         idx_to_item: Dict[str, PreparedItem] = {}
         payload: Dict[str, str] = {}
         for i, item in enumerate(items):
@@ -571,9 +850,11 @@ class AIEnrichmentWorker:
             parsed = json.loads(self._strip_markdown_fences(raw))
             if not isinstance(parsed, dict):
                 raise ValidationError("batch response must be a JSON object")
+            self._record_clean_success()
             self.aimd.on_success()
         except asyncio.TimeoutError:
             logging.warning("Batch timeout for doc_ids=%s", [i.doc_id for i in items])
+            self._record_pressure_event("batch-timeout")
             self.aimd.on_failure()
             for item in items:
                 self._queue_retry_increment(item.doc_id)
@@ -585,6 +866,7 @@ class AIEnrichmentWorker:
                     "HTTP %d on batch — triggering AIMD multiplicative decrease",
                     exc.status,
                 )
+                self._record_pressure_event(f"batch-http-{exc.status}")
                 self.aimd.on_failure()
                 await asyncio.sleep(TIMEOUT_RECOVERY_SECONDS)
             else:
@@ -600,12 +882,16 @@ class AIEnrichmentWorker:
             )
             parsed = self._salvage_partial_batch(raw)
             if not parsed:
+                if self._is_memory_pressure_text(raw):
+                    self._record_pressure_event("batch-raw-memory-pressure")
                 self.aimd.on_failure()
                 for item in items:
                     self._queue_retry_increment(item.doc_id)
                 return
         except (ValidationError, aiohttp.ClientError) as exc:
             logging.warning("Batch request/validation failure: %s", exc)
+            if self._is_memory_pressure_text(str(exc)):
+                self._record_pressure_event("batch-client-memory-pressure")
             for item in items:
                 self._queue_retry_increment(item.doc_id)
             return
@@ -637,6 +923,7 @@ class AIEnrichmentWorker:
         session: aiohttp.ClientSession,
         item: PreparedItem,
     ) -> None:
+        self._apply_memory_guard_cap()
         prompt = self._build_single_prompt(item.prepared_text)
         raw = ""
         try:
@@ -651,9 +938,11 @@ class AIEnrichmentWorker:
             self._queue_success_update(
                 item.doc_id, rehydrated, profanity, ACTIVE_MODEL_KEY
             )
+            self._record_clean_success()
             self.aimd.on_success()
         except asyncio.TimeoutError:
             logging.warning("Timeout for doc_id=%s", item.doc_id)
+            self._record_pressure_event("single-timeout")
             self.aimd.on_failure()
             self._queue_retry_increment(item.doc_id)
             await asyncio.sleep(TIMEOUT_RECOVERY_SECONDS)
@@ -664,6 +953,7 @@ class AIEnrichmentWorker:
                     exc.status,
                     item.doc_id,
                 )
+                self._record_pressure_event(f"single-http-{exc.status}")
                 self.aimd.on_failure()
                 await asyncio.sleep(TIMEOUT_RECOVERY_SECONDS)
             else:
@@ -680,6 +970,8 @@ class AIEnrichmentWorker:
             logging.warning(
                 "Validation/request failure for doc_id=%s error=%s", item.doc_id, exc
             )
+            if self._is_memory_pressure_text(str(exc)):
+                self._record_pressure_event("single-client-memory-pressure")
             self._queue_retry_increment(item.doc_id)
 
     async def _handle_concurrent_items_async(
@@ -760,6 +1052,12 @@ class AIEnrichmentWorker:
             "concurrency" if self.capabilities.supports_concurrency else "batching",
             self.aimd.current_limit,
             self.aimd.optimal_limit,
+        )
+        await self._run_startup_warmup_probe()
+        logging.info(
+            "Post-warmup AIMD start: %s=%d",
+            self.aimd.label,
+            self.aimd.current_limit,
         )
 
         while True:
