@@ -1,0 +1,12 @@
+services:
+  ai-enrichment-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.ai-enrichment
+    container_name: ai-enrichment-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "ai_enrichment_worker.py"]

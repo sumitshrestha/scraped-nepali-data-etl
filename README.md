@@ -64,3 +64,34 @@ The output file `extracted_posts.json` is a list of posts, each with the followi
 
 ## License
 MIT License
+
+## Run AI Enrichment Worker As A Docker Background Service
+
+1. Copy `.env.sample` to `.env` and set worker values.
+2. If MongoDB or Ollama is running on your host machine, do not keep `localhost` inside container settings.
+3. Set these in `.env` when using host services from Docker:
+  - `MONGO_URI=mongodb://host.docker.internal:27017/?replicaSet=rs0`
+  - `OLLAMA_ENDPOINT=http://host.docker.internal:11434`
+
+Build and run in detached mode:
+
+```bash
+docker compose -f docker-compose.ai-enrichment.yml up -d --build
+```
+
+View logs:
+
+```bash
+docker compose -f docker-compose.ai-enrichment.yml logs -f
+```
+
+Stop service:
+
+```bash
+docker compose -f docker-compose.ai-enrichment.yml down
+```
+
+Notes:
+- Service name: `ai-enrichment-worker`
+- Restart policy: `unless-stopped`
+- File logs are persisted to the host folder `./logs`.
