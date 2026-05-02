@@ -1074,8 +1074,14 @@ class AIEnrichmentWorker:
 
 
 def main() -> None:
+    os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("logs/ai_enrichment_worker.log", encoding="utf-8"),
+        ],
     )
 
     worker = AIEnrichmentWorker()
