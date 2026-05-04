@@ -6,7 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 COPY requirements.ai-enrichment.txt ./requirements.ai-enrichment.txt
-RUN pip install --no-cache-dir -r requirements.ai-enrichment.txt
+RUN python -m pip install --upgrade pip setuptools wheel && \
+		python -m pip install \
+			--no-cache-dir \
+			--index-url https://pypi.org/simple \
+			--retries 10 \
+			--timeout 120 \
+			-r requirements.ai-enrichment.txt
 
 COPY ai_enrichment_worker.py ./ai_enrichment_worker.py
 
