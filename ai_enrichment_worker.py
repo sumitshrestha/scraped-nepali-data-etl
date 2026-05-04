@@ -89,7 +89,28 @@ _TOKEN_SAFETY_STRIP = re.compile(r"[^\w\u0900-\u097F.,?!']")
 _PLACEHOLDER_RE = re.compile(r"\[ENG_(\d+)\]")
 _MARKDOWN_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
 
-ENGLISH_WORDS = frozenset(top_n_list("en", WORDFREQ_ENGLISH_TOPN))
+_ENGLISH_WORDS_CACHE: Optional[frozenset[str]] = None
+
+
+def _get_english_words() -> frozenset[str]:
+    """Load and cache English frequency words lazily after logging is configured."""
+    global _ENGLISH_WORDS_CACHE
+    if _ENGLISH_WORDS_CACHE is None:
+        try:
+            _ENGLISH_WORDS_CACHE = frozenset(top_n_list("en", WORDFREQ_ENGLISH_TOPN))
+            logging.info(
+                "Loaded %d English reference words for passthrough detection",
+                len(_ENGLISH_WORDS_CACHE),
+            )
+        except Exception as exc:
+            logging.warning(
+                "Failed to load wordfreq English list (top_n=%d): %s. "
+                "Continuing with passthrough-all-english disabled.",
+                WORDFREQ_ENGLISH_TOPN,
+                exc,
+            )
+            _ENGLISH_WORDS_CACHE = frozenset()
+    return _ENGLISH_WORDS_CACHE
 
 # Fraction of max_context_tokens used as the token packing budget per batch
 TOKEN_BUDGET_RATIO = 0.80
@@ -609,11 +630,14 @@ class AIEnrichmentWorker:
         tokens = cleaned_text.split()
         if not tokens:
             return False
+        english_words = _get_english_words()
+        if not english_words:
+            return False
         for tok in tokens:
             norm = self._normalize_english_lookup(tok)
             if not norm:
                 return False
-            if norm not in ENGLISH_WORDS:
+            if norm not in english_words:
                 return False
         return True
 
@@ -1158,11 +1182,14 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler("logs/ai_enrichment_worker.log", encoding="utf-8"),
         ],
     )
+
+    logging.info("AI enrichment worker process bootstrap started")
 
     worker = AIEnrichmentWorker()
     try:
