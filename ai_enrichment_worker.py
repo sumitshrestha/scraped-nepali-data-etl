@@ -13,6 +13,7 @@ Supports both local Ollama nodes (batching strategy) and cloud LLM APIs
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -260,6 +261,63 @@ except ImportError:
     def count_tokens(text: str) -> int:
         """Approximate token count using a words × 1.3 heuristic (accounts for subword splits)."""
         return max(1, int(len(text.split()) * 1.3))
+
+
+# ---------------------------------------------------------------------------
+# Phonetic alignment map
+# ---------------------------------------------------------------------------
+
+
+def generate_alignment_map(
+    romanized_text: str, devanagari_text: str
+) -> Dict[str, List[int]]:
+    if not romanized_text or not devanagari_text:
+        return {}
+
+    source_words = romanized_text.split()
+    target_words = devanagari_text.split()
+
+    source_len = len(source_words)
+    target_len = len(target_words)
+
+    if source_len == 0 or target_len == 0:
+        return {}
+
+    phonetic_map = {
+        'k': ['क', 'ख'], 'g': ['ग', 'घ'], 'c': ['च', 'छ'], 'j': ['ज', 'झ'],
+        't': ['ट', 'ठ', 'त', 'थ'], 'd': ['ड', 'ढ', 'द', 'ध'],
+        'n': ['न', 'ण', 'ञ'], 'p': ['प', 'फ'], 'b': ['ब', 'भ'], 'm': ['म'],
+        'y': ['य'], 'r': ['र', 'ृ'], 'l': ['ल'], 'v': ['व'], 'w': ['व'],
+        's': ['स', 'श', 'ष'], 'h': ['ह'], 'a': ['अ', 'आ'], 'i': ['इ', 'ई'],
+        'u': ['उ', 'ऊ'], 'e': ['ए'], 'o': ['ओ'],
+    }
+
+    alignment_map: Dict[str, List[int]] = {}
+
+    for d_idx, d_word in enumerate(target_words):
+        ratio = d_idx / target_len
+        estimated_r_idx = int(math.floor(ratio * source_len))
+
+        search_radius = 2
+        start_idx = max(0, estimated_r_idx - search_radius)
+        end_idx = min(source_len, estimated_r_idx + search_radius + 1)
+
+        matched_indices: List[int] = []
+        d_char = d_word[0] if d_word else ''
+
+        for r_idx in range(start_idx, end_idx):
+            r_word = source_words[r_idx].lower()
+            r_char = r_word[0] if r_word else ''
+
+            if r_char in phonetic_map and d_char in phonetic_map[r_char]:
+                matched_indices.append(r_idx)
+
+        if not matched_indices:
+            matched_indices = [estimated_r_idx]
+
+        alignment_map[str(d_idx)] = matched_indices
+
+    return alignment_map
 
 
 # ---------------------------------------------------------------------------
@@ -730,18 +788,22 @@ class AIEnrichmentWorker:
         devanagari_text: str,
         profanity_score: Optional[float],
         model_version: str,
+        alignment_map: Optional[Dict[str, List[int]]] = None,
     ) -> None:
+        update_fields: Dict[str, Any] = {
+            "ai_slots.devanagari_translation": devanagari_text,
+            "ai_slots.profanity_score": profanity_score,
+            "ai_slots.model_version": model_version,
+            "ai_slots.translated_at": time.time(),
+        }
+
+        if alignment_map is not None:
+            update_fields["ai_slots.alignment_map"] = alignment_map
+
         self.pending_ops.append(
             UpdateOne(
                 {"_id": doc_id},
-                {
-                    "$set": {
-                        "ai_slots.devanagari_translation": devanagari_text,
-                        "ai_slots.profanity_score": profanity_score,
-                        "ai_slots.model_version": model_version,
-                        "ai_slots.translated_at": time.time(),
-                    }
-                },
+                {"$set": update_fields},
             )
         )
 
@@ -908,8 +970,9 @@ class AIEnrichmentWorker:
                 rehydrated = self._rehydrate_placeholders(
                     devanagari, item.placeholder_map
                 )
+                alignment_map = generate_alignment_map(item.cleaned_text, rehydrated)
                 self._queue_success_update(
-                    item.doc_id, rehydrated, profanity, ACTIVE_MODEL_KEY
+                    item.doc_id, rehydrated, profanity, ACTIVE_MODEL_KEY, alignment_map
                 )
             except ValidationError:
                 self._queue_retry_increment(item.doc_id)
@@ -935,8 +998,9 @@ class AIEnrichmentWorker:
                 item.prepared_text, parsed
             )
             rehydrated = self._rehydrate_placeholders(devanagari, item.placeholder_map)
+            alignment_map = generate_alignment_map(item.cleaned_text, rehydrated)
             self._queue_success_update(
-                item.doc_id, rehydrated, profanity, ACTIVE_MODEL_KEY
+                item.doc_id, rehydrated, profanity, ACTIVE_MODEL_KEY, alignment_map
             )
             self._record_clean_success()
             self.aimd.on_success()
