@@ -8,10 +8,6 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-warm the tiktoken BPE cache so the first count_tokens() call at runtime
-# is instant rather than triggering a network download inside the container.
-RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
-
 COPY ai_enrichment_worker.py ./ai_enrichment_worker.py
 
 RUN mkdir -p /app/logs

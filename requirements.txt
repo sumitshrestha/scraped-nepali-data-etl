@@ -3,5 +3,4 @@ lingua-language-detector
 ijson
 pymongo
 aiohttp
-tiktoken
 wordfreq
