@@ -272,13 +272,18 @@ def _infer_ollama_capabilities(model_name: str) -> ModelCapabilities:
 try:
     import tiktoken as _tiktoken
 
-    _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
+    _TIKTOKEN_ENC = (
+        None  # initialized lazily on first use to avoid blocking at import time
+    )
 
     def count_tokens(text: str) -> int:
+        global _TIKTOKEN_ENC
+        if _TIKTOKEN_ENC is None:
+            _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
         return len(_TIKTOKEN_ENC.encode(text))
 
 except ImportError:
-    _TIKTOKEN_ENC = None  # type: ignore[assignment]
+    _tiktoken = None  # type: ignore[assignment]
 
     def count_tokens(text: str) -> int:
         """Approximate token count using a words × 1.3 heuristic (accounts for subword splits)."""
