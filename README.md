@@ -95,3 +95,5 @@ Notes:
 - Service name: `ai-enrichment-worker`
 - Restart policy: `unless-stopped`
 - File logs are persisted to the host folder `./logs`.
+- Compose sets a service-level Docker log driver (`json-file`) so
+  `docker compose logs` works even when the host daemon default is `none`.
