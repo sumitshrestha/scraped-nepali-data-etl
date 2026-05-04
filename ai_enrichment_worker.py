@@ -268,26 +268,32 @@ def _infer_ollama_capabilities(model_name: str) -> ModelCapabilities:
 # ---------------------------------------------------------------------------
 # Lightweight token counter (tiktoken when available, word-count heuristic otherwise)
 # ---------------------------------------------------------------------------
+# tiktoken is fully lazy: the import AND encoder init are deferred to first
+# use of count_tokens() so they never block module-level startup.
 
-try:
-    import tiktoken as _tiktoken
+_TIKTOKEN_ENC = None  # type: ignore[assignment]
+_TIKTOKEN_AVAILABLE: Optional[bool] = None  # None = not yet probed
 
-    _TIKTOKEN_ENC = (
-        None  # initialized lazily on first use to avoid blocking at import time
-    )
 
-    def count_tokens(text: str) -> int:
-        global _TIKTOKEN_ENC
-        if _TIKTOKEN_ENC is None:
-            _TIKTOKEN_ENC = _tiktoken.get_encoding("cl100k_base")
+def count_tokens(text: str) -> int:
+    """Return an approximate token count for *text*.
+
+    Uses tiktoken cl100k_base if available, otherwise falls back to a
+    words × 1.3 heuristic.  Both the import and the encoder init are
+    deferred to the first call so startup is never blocked by a download.
+    """
+    global _TIKTOKEN_ENC, _TIKTOKEN_AVAILABLE
+    if _TIKTOKEN_AVAILABLE is None:
+        try:
+            import tiktoken as _tiktoken_mod
+
+            _TIKTOKEN_ENC = _tiktoken_mod.get_encoding("cl100k_base")
+            _TIKTOKEN_AVAILABLE = True
+        except Exception:
+            _TIKTOKEN_AVAILABLE = False
+    if _TIKTOKEN_AVAILABLE and _TIKTOKEN_ENC is not None:
         return len(_TIKTOKEN_ENC.encode(text))
-
-except ImportError:
-    _tiktoken = None  # type: ignore[assignment]
-
-    def count_tokens(text: str) -> int:
-        """Approximate token count using a words × 1.3 heuristic (accounts for subword splits)."""
-        return max(1, int(len(text.split()) * 1.3))
+    return max(1, int(len(text.split()) * 1.3))
 
 
 # ---------------------------------------------------------------------------
