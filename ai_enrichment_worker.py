@@ -284,12 +284,28 @@ def generate_alignment_map(
         return {}
 
     phonetic_map = {
-        'k': ['क', 'ख'], 'g': ['ग', 'घ'], 'c': ['च', 'छ'], 'j': ['ज', 'झ'],
-        't': ['ट', 'ठ', 'त', 'थ'], 'd': ['ड', 'ढ', 'द', 'ध'],
-        'n': ['न', 'ण', 'ञ'], 'p': ['प', 'फ'], 'b': ['ब', 'भ'], 'm': ['म'],
-        'y': ['य'], 'r': ['र', 'ृ'], 'l': ['ल'], 'v': ['व'], 'w': ['व'],
-        's': ['स', 'श', 'ष'], 'h': ['ह'], 'a': ['अ', 'आ'], 'i': ['इ', 'ई'],
-        'u': ['उ', 'ऊ'], 'e': ['ए'], 'o': ['ओ'],
+        "k": ["क", "ख"],
+        "g": ["ग", "घ"],
+        "c": ["च", "छ"],
+        "j": ["ज", "झ"],
+        "t": ["ट", "ठ", "त", "थ"],
+        "d": ["ड", "ढ", "द", "ध"],
+        "n": ["न", "ण", "ञ"],
+        "p": ["प", "फ"],
+        "b": ["ब", "भ"],
+        "m": ["म"],
+        "y": ["य"],
+        "r": ["र", "ृ"],
+        "l": ["ल"],
+        "v": ["व"],
+        "w": ["व"],
+        "s": ["स", "श", "ष"],
+        "h": ["ह"],
+        "a": ["अ", "आ"],
+        "i": ["इ", "ई"],
+        "u": ["उ", "ऊ"],
+        "e": ["ए"],
+        "o": ["ओ"],
     }
 
     alignment_map: Dict[str, List[int]] = {}
@@ -303,11 +319,11 @@ def generate_alignment_map(
         end_idx = min(source_len, estimated_r_idx + search_radius + 1)
 
         matched_indices: List[int] = []
-        d_char = d_word[0] if d_word else ''
+        d_char = d_word[0] if d_word else ""
 
         for r_idx in range(start_idx, end_idx):
             r_word = source_words[r_idx].lower()
-            r_char = r_word[0] if r_word else ''
+            r_char = r_word[0] if r_word else ""
 
             if r_char in phonetic_map and d_char in phonetic_map[r_char]:
                 matched_indices.append(r_idx)
