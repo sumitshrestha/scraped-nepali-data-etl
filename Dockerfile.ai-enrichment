@@ -5,8 +5,8 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.ai-enrichment.txt ./requirements.ai-enrichment.txt
+RUN pip install --no-cache-dir -r requirements.ai-enrichment.txt
 
 COPY ai_enrichment_worker.py ./ai_enrichment_worker.py
 
