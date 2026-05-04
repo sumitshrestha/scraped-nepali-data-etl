@@ -1192,13 +1192,19 @@ class AIEnrichmentWorker:
 
 
 def main() -> None:
+    import sys
+
+    # Write directly to stdout before logging is configured so Docker always
+    # captures at least one line even if the logging stack has issues.
+    print("AI enrichment worker process starting", flush=True, file=sys.stdout)
+
     os.makedirs("logs", exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         force=True,
         handlers=[
-            logging.StreamHandler(),
+            logging.StreamHandler(sys.stdout),
             logging.FileHandler("logs/ai_enrichment_worker.log", encoding="utf-8"),
         ],
     )
