@@ -112,6 +112,7 @@ def _get_english_words() -> frozenset[str]:
             _ENGLISH_WORDS_CACHE = frozenset()
     return _ENGLISH_WORDS_CACHE
 
+
 # Fraction of max_context_tokens used as the token packing budget per batch
 TOKEN_BUDGET_RATIO = 0.80
 
@@ -1164,8 +1165,21 @@ class AIEnrichmentWorker:
             self.aimd.current_limit,
         )
 
+        cycle = 0
         while True:
+            cycle += 1
+            started = time.perf_counter()
+            logging.info("Worker cycle %d started", cycle)
+
             seen = await self.process_once_async()
+            elapsed = time.perf_counter() - started
+            logging.info(
+                "Worker cycle %d completed: fetched=%d elapsed=%.2fs",
+                cycle,
+                seen,
+                elapsed,
+            )
+
             if seen == 0:
                 logging.info(
                     "No eligible documents found. Sleeping for %ss",
