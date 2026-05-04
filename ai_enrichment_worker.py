@@ -24,7 +24,6 @@ import aiohttp
 from dotenv import load_dotenv
 from pymongo import DESCENDING, MongoClient, UpdateOne
 from pymongo.collection import Collection
-from wordfreq import top_n_list
 
 load_dotenv()
 
@@ -97,6 +96,8 @@ def _get_english_words() -> frozenset[str]:
     global _ENGLISH_WORDS_CACHE
     if _ENGLISH_WORDS_CACHE is None:
         try:
+            from wordfreq import top_n_list  # deferred: wordfreq loads a large binary on import
+
             _ENGLISH_WORDS_CACHE = frozenset(top_n_list("en", WORDFREQ_ENGLISH_TOPN))
             logging.info(
                 "Loaded %d English reference words for passthrough detection",
