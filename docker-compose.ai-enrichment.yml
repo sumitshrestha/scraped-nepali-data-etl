@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ai-enrichment
+      network: host
     container_name: ai-enrichment-worker
     restart: unless-stopped
     network_mode: "host"
@@ -15,4 +16,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    command: ["python", "ai_enrichment_worker.py"]
+    command: [ "python", "ai_enrichment_worker.py" ]
