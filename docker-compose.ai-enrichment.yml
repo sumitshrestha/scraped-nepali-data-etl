@@ -7,6 +7,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./logs:/app/logs
     logging:
@@ -14,4 +16,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    command: ["python", "ai_enrichment_worker.py"]
