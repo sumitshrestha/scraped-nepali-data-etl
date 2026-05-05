@@ -14,6 +14,11 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 			--timeout 120 \
 			-r requirements.ai-enrichment.txt
 
+# PRE-CACHE TIKTOKEN VOCABULARY
+# This prevents tiktoken from making a blocking HTTP request at runtime, 
+# which would otherwise freeze the asyncio event loop.
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+
 COPY ai_enrichment_worker.py ./ai_enrichment_worker.py
 
 RUN mkdir -p /app/logs
