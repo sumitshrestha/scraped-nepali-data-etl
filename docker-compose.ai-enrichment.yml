@@ -3,8 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.ai-enrichment
+      network: host
     container_name: ai-enrichment-worker
     restart: unless-stopped
+    network_mode: "host"
     env_file:
       - .env
     volumes:

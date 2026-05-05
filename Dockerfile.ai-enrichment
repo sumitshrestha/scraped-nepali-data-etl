@@ -6,14 +6,23 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 COPY requirements.ai-enrichment.txt ./requirements.ai-enrichment.txt
-RUN python -m pip install --upgrade pip setuptools wheel && \
+RUN python -m pip install --default-timeout=1000 --upgrade pip setuptools wheel && \
 		python -m pip install \
 			--no-cache-dir \
 			--index-url https://pypi.org/simple \
+			--retries 10 \
+			--timeout 120 \
 			-r requirements.ai-enrichment.txt
 
-# Pre-cache the tiktoken vocabulary to prevent runtime event-loop blocking
-RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+# PRE-CACHE TIKTOKEN VOCABULARY (Forced IPv4)
+# This intercepts Python's socket library to drop IPv6 connections, 
+# preventing the Azure blob download from hanging indefinitely.
+RUN python -c "\
+import socket; \
+old_getaddrinfo = socket.getaddrinfo; \
+socket.getaddrinfo = lambda *args, **kwargs: [r for r in old_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]; \
+import tiktoken; \
+tiktoken.get_encoding('cl100k_base')"
 
 COPY ai_enrichment_worker.py ./ai_enrichment_worker.py
 
